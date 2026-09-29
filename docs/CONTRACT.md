@@ -8,6 +8,10 @@ Character discovery reads FModel-style JSON exports under a user-selected source
 
 The primary Blender send operator performs fresh FBX export followed by UE sync as a single asynchronous operation, defaulting to offline commandlet import without requiring an interactive editor. It must not send a previous manifest when the new export fails. First application of a different discovered mesh enables missing reference placeholders; reapplying the same source preserves an explicit advanced opt-out. UE creates and saves assets at exact manifest package paths; game placeholders remain excluded from export_assets. Independent export/existing-job commands remain advanced operations. Installation paths may be auto-detected only from a matching project engine association and complete existing tools; ambiguous installs require manual configuration. Unsaved Blender files use an absolute per-user cache directory for jobs.
 
+Since v0.2.1, the offline UE process receives `-EnablePlugins=PythonScriptPlugin,EditorScriptingUtilities,GeometryScripting,ControlRig`. This is a process-only dependency override, including for plugins explicitly disabled in the project; the project descriptor is not rewritten. Live-editor sessions still require these APIs already loaded. The receiver verifies all required scripting APIs before any asset mutation, and missing startup reports include the process exit code and log path.
+
+FBX export always disables animation (`bake_anim=False`) and leaf bones (`add_leaf_bones=False`), and uses face smoothing (`mesh_smooth_type='FACE'`). These existing export settings are the required character-mod preset, independent of the user's manual FBX dialog settings. Shape keys and all source bones remain preserved.
+
 Manifest is UTF-8 JSON, schema_version=1. Object references use canonical `/Game/Folder/Asset` package paths (not `.Asset` suffix). A job directory contains `manifest.json`, `meshes/mesh.fbx`, optional `textures/*`, and generated reports. All source_file values are relative, resolved inside the job directory; reject escapes. Never ship source paths or user content in the addon distribution.
 
 ```json

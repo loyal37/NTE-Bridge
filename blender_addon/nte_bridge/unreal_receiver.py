@@ -129,6 +129,20 @@ def _rename_generated(unreal, asset, destination):
     return asset
 
 
+def _check_editor_dependencies(unreal):
+    requirements = (
+        ("Editor Scripting Utilities（EditorScriptingUtilities）", ("EditorAssetLibrary",)),
+        ("Geometry Script（GeometryScripting）", (
+            "GeometryScript_AssetUtils", "GeometryScript_MeshQueries", "DynamicMesh")),
+        ("Control Rig（ControlRig）", ("RigHierarchy",)),
+    )
+    missing = [label for label, names in requirements if any(not hasattr(unreal, name) for name in names)]
+    if missing:
+        raise BridgeError("UE 未加载桥接所需插件：" + "、".join(missing)
+                          + "。请关闭目标工程后用新版桥接的“后台导入”重试；"
+                            "若使用已打开的 UE，请在插件设置中启用这些插件并重启编辑器。当前尚未修改资产。")
+
+
 def _run(unreal, manifest, job_dir, report):
     current_project = unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path())
     report["project_file"] = _canonical_file(current_project)
@@ -138,11 +152,8 @@ def _run(unreal, manifest, job_dir, report):
     version = unreal.SystemLibrary.get_engine_version()
     report["engine_version"] = version
     if not version.startswith("5.6."):
-        raise BridgeError("NTE Bridge v0.1 requires Unreal Engine 5.6; found " + version)
-    if not hasattr(unreal, "GeometryScript_AssetUtils"):
-        raise BridgeError("Enable the built-in Geometry Scripting plugin and restart UE for UV verification; project settings were not changed")
-    if not hasattr(unreal, "RigHierarchy"):
-        raise BridgeError("Enable the built-in Control Rig plugin and restart UE for skeleton verification; project settings were not changed")
+        raise BridgeError("NTE Bridge 需要 Unreal Engine 5.6，当前为 " + version)
+    _check_editor_dependencies(unreal)
     mesh_spec = manifest["mesh"]
     create = manifest.get("create_placeholders", False)
     skeleton = _asset(unreal, mesh_spec["skeleton_path"], unreal.Skeleton)

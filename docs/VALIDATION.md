@@ -1,4 +1,16 @@
-# v0.2.0 验证记录
+# v0.2.1 验证记录
+
+日期：2026-09-29。Blender 使用指定的 4.5.7 LTS，UE 为 5.6.1。
+
+- 56 项纯 Python 测试通过。新增依赖缺省/明确禁用时的临时加载、缺少 API 时提前拒绝且不修改资产、目标工程已打开时拒绝启动、无报告时清除旧成功状态并给出日志位置等检查。
+- 使用用户本次失败任务的 Nitsa FBX 副本，实际导入全新隔离工程。工程描述文件明确关闭 PythonScriptPlugin、EditorScriptingUtilities、GeometryScripting、ControlRig，四项仍通过进程命令行成功加载，导入退出码为 0。
+- 保留 11 个独立材质槽、592 根骨骼、83 个形态键和 4 层 UV。按原始完整路径保存 13 个资产：10 个不同材质占位、网格、Skeleton 和 PhysicsAsset；UE 同步报告无警告。
+- 原始任务清单、FBX、用户 `HT.uproject` 的 SHA256 前后相同，隔离工程描述文件也逐字节不变。本次真实 Nitsa 输入没有替换贴图，不将本次结果视为贴图集成验证。
+- Blender 4.5.7 的 15 项合成导出检查全部通过。源模型带对象、骨骼、形态键三组真实动画；用 Blender 自带解析器检查实际 FBX，无动画堆栈/层/曲线对象，按面平滑数据为 `ByPolygon` 且平面/平滑面标记为 `[0, 1]`。启用动画读取且不忽略叶骨重新导入，仍没有动画和额外叶骨；形态键、UV、独立材质槽及原场景/原文件不变。已有导出设置与用户要求一致，无需改变运行代码。
+
+本地证据：`artifacts/dependency_smoke/run-hq7otpzs/result.json` 及同目录任务日志、`artifacts/blender_smoke/result.json`。未重复与本次依赖修复无关的烘焙/打包或游戏内测试。
+
+## v0.2.0 验证记录
 
 日期：2026-09-29。Blender 固定使用 `D:/blender4,5/blender.exe`：4.5.7 LTS，构建 `a9874eeece8d`。
 

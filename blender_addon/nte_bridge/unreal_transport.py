@@ -17,6 +17,9 @@ import uuid
 from .core import BridgeError, load_manifest, write_json
 
 DEFAULT_ENGINE = "D:/ue/UE_5.6"
+REQUIRED_COMMANDLET_PLUGINS = (
+    "PythonScriptPlugin", "EditorScriptingUtilities", "GeometryScripting", "ControlRig",
+)
 
 
 def _canonical(path):
@@ -172,6 +175,10 @@ def commandlet_command(manifest_path, engine_dir=DEFAULT_ENGINE):
         raise BridgeError("UnrealEditor-Cmd.exe was not found: " + str(editor))
     source, report_file, runner = _invocation_files(source)
     argv = [editor.as_posix(), Path(manifest["project_file"]).resolve().as_posix(), "-run=pythonscript",
+            # These editor APIs are needed only by the bridge process. UE's
+            # command-line override also works when disabled in the .uproject,
+            # without rewriting the user's persistent plugin configuration.
+            "-EnablePlugins=" + ",".join(REQUIRED_COMMANDLET_PLUGINS),
             "-script=" + runner.as_posix(), "-unattended", "-nop4", "-nosplash", "-nullrhi",
             "-stdout", "-FullStdOutLogOutput"]
     return argv, report_file
@@ -211,7 +218,7 @@ def run_commandlet_job(manifest_path, engine_dir=DEFAULT_ENGINE, timeout=300):
     manifest = load_manifest(source)
     _transport_status(source, manifest, "Starting offline Unreal sync; asset sync has not completed")
     if _project_editor_running(manifest["project_file"]):
-        raise BridgeError("Close the target Unreal editor before offline sync, or use Send to Editor")
+        raise BridgeError("目标 UE 工程仍在编辑器中打开；请先关闭该工程再后台导入，或选择发送到已打开的 UE。")
     argv, report_file = commandlet_command(source, engine_dir)
     log_path = source.with_name("ue_commandlet.log")
     with log_path.open("w", encoding="utf-8") as log:
@@ -224,6 +231,11 @@ def run_commandlet_job(manifest_path, engine_dir=DEFAULT_ENGINE, timeout=300):
                                      timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except subprocess.TimeoutExpired as exc:
             raise BridgeError("Unreal commandlet timed out; inspect " + str(log_path)) from exc
+    if not report_file.is_file():
+        message = ("UE 后台导入未生成报告（退出码 %d）。请检查引擎插件是否完整；日志：%s"
+                   % (process.returncode, log_path))
+        _transport_status(source, manifest, message)
+        raise BridgeError(message)
     report = _finish(source, report_file, manifest)
     if process.returncode:
         report["success"] = False
