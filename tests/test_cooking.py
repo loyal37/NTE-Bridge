@@ -172,6 +172,62 @@ class CookingTests(unittest.TestCase):
         with self.assertRaisesRegex(BridgeError, '保持工程挂载名'):
             export_selection(stage, self.root / 'xg/Wrong/Content/Characters')
 
+    def player_selection(self, include_colliding_asset=False):
+        source = '/Game/Characters/Player/A/Sub/SK_Body'
+        for extension in ('.uasset', '.uexp'):
+            path = self.cooked / ('HT/Content/' + source[len('/Game/'):] + extension)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(('nested-character' + extension).encode())
+        self.request['character_folder'] = '/Game/Characters/Player/A'
+        self.catalog['assets'].append({'asset_path': source, 'asset_type': 'SkeletalMesh'})
+        self.selection['selected_assets'] = [source]
+        if include_colliding_asset:
+            other = '/Game/Characters/A/Sub/SK_Body'
+            for extension in ('.uasset', '.uexp'):
+                path = self.cooked / ('HT/Content/' + other[len('/Game/'):] + extension)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'different shared asset')
+            self.catalog['assets'].append({'asset_path': other, 'asset_type': 'SkeletalMesh'})
+            self.selection['selected_assets'].append(other)
+        self.report = snapshot_cooked(self.request, self.catalog, self.cooked, 'cook-id', file_sha256(self.request_path))
+        self.save_report()
+        return stage_selection(self.selection_path)
+
+    def test_character_exports_directly_without_player_and_staging_keeps_game_mount(self):
+        stage = self.player_selection()
+        stale = self.export / 'A/Sub/SK_Body.ubulk'
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b'old selected bulk')
+        result = export_selection(stage, self.export)
+        self.assertFalse((self.export / 'Player').exists())
+        self.assertFalse(stale.exists())
+        self.assertTrue((self.export / 'A/Sub/SK_Body.uasset').is_file())
+        self.assertEqual(stage['selected_assets'], ['/Game/Characters/Player/A/Sub/SK_Body'])
+        for item in result['exported_files']:
+            self.assertIn('/Characters/Player/A/', item['path'])
+            self.assertIn('/Characters/A/Sub/', item['export_relative_path'])
+            self.assertEqual(file_sha256(Path(stage['source_dir']) / item['path']), item['sha256'])
+            self.assertEqual(file_sha256(item['exported_path']), item['sha256'])
+
+    def test_character_rebase_collision_fails_before_touching_exported_files(self):
+        stage = self.player_selection(include_colliding_asset=True)
+        previous = self.export / 'A/Sub/SK_Body.uasset'
+        previous.parent.mkdir(parents=True)
+        previous.write_bytes(b'previous export')
+        with self.assertRaisesRegex(BridgeError, '同一个角色导出文件'):
+            export_selection(stage, self.export)
+        self.assertEqual(previous.read_bytes(), b'previous export')
+        self.assertFalse((previous.parent / 'SK_Body.uexp').exists())
+
+    def test_character_export_mapping_has_strict_scope_and_root_boundary(self):
+        from nte_bridge.packaging import exported_relative_path
+        stage = self.player_selection()
+        sibling = 'HT/Content/Characters/Player/AOther/Sub/SK_Body.uasset'
+        self.assertEqual(exported_relative_path(stage, sibling), sibling)
+        stage['character_folder'] = '/Game/Characters'
+        original = 'HT/Content/Characters/A/Sub/SK_Body.uasset'
+        self.assertEqual(exported_relative_path(stage, original), original)
+
     def test_package_exports_then_adapter_only_consumes_fresh_staging_without_cook(self):
         adapter = self.root / 'adapter.dll'
         adapter.write_bytes(b'test adapter')

@@ -85,10 +85,11 @@ def run(fixture_path, engine, packager, phase='all'):
         assert file_sha256(stale) == stale_hash
         for path in selected:
             for item in by_path[path]['files']:
-                copied = folder / 'xg' / item['path']
+                expected = project.stem + '/Content/Characters/' + scope.rsplit('/', 1)[-1] + '/' + path[len(scope) + 1:] + Path(item['path']).suffix
+                copied = folder / 'xg' / expected
                 assert copied.is_file() and file_sha256(copied) == item['sha256'], str(copied)
         for relative in ('Textures/T_ID_TEX', 'Textures/T_LIGHT_MAP', 'Materials/M_Original'):
-            assert not (export / (scope.removeprefix('/Game/Characters/') + '/' + relative + '.uasset')).exists()
+            assert not (export / (scope.rsplit('/', 1)[-1] + '/' + relative + '.uasset')).exists()
         utoc = next(item['path'] for item in packaged['outputs'] if item['path'].endswith('.utoc'))
         container_folder = folder / 'container-validation'
         container_folder.mkdir(exist_ok=True)

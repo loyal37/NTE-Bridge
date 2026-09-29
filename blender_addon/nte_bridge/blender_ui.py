@@ -547,7 +547,7 @@ class NTEBridgeSettings(bpy.types.PropertyGroup):
         description='显示烘焙时生成的共享资产及引擎依赖；不可打包的引用仍禁止勾选')
     cook_export_directory: StringProperty(name='烘焙资产导出目录', subtype='DIR_PATH',
         default='D:/Neverness to Everness Mod Loader/cook/packager/xg/HT/Content/Characters',
-        description='所选 cooked 文件导出到此 Characters 目录并保留子目录，随后自动打包')
+        description='角色文件夹直接导出到此目录，如 Characters/078_Nitsa；保留角色内部子目录，随后自动打包')
     last_manifest: StringProperty(name="最近任务", subtype='FILE_PATH')
     last_report: StringProperty(name="最近报告", subtype='FILE_PATH')
     status: StringProperty(default='先读取解包的角色文件夹，再选择 Blender 网格。')
@@ -967,25 +967,31 @@ class NTEBRIDGE_OT_cook(_WorkerModal, bpy.types.Operator):
     def execute(self, context):
         settings = context.scene.nte_bridge
         clear_cook(settings)
+        reservation = None
         try:
+            from .cooking import prepare_cook_request
             project = resolved_project(settings)
             folder = character_folder(settings)
             engine_dir = settings.engine_dir.strip() or detect_engine_dir(str(project))
             if not engine_dir:
                 raise BridgeError('未找到工程对应的 UE，请在高级设置指定 UE 安装目录。')
             engine = Path(bpy.path.abspath(engine_dir)).resolve()
-            root = ensure_cache(settings).parent / 'Cooks' / ('run-' + new_id())
-            root.mkdir(parents=True, exist_ok=False)
-            request = root / 'cook_request.json'
-            self._report = root / 'cook_report.json'
-            write_json(request, {'schema_version': 1, 'project_file': str(project),
-                                'character_folder': folder, 'excluded_assets': cook_excluded_assets(settings)})
+            reservation = prepare_cook_request(ensure_cache(settings).parent,
+                {'schema_version': 1, 'project_file': str(project), 'character_folder': folder,
+                 'excluded_assets': cook_excluded_assets(settings)})
+            request = Path(reservation['request_path'])
+            root = Path(reservation['cache_directory'])
+            self._report = Path(reservation['report_path'])
             command = [str(worker_python()), str(Path(__file__).with_name('cli.py')), 'cook',
-                       '--request', str(request), '--engine-dir', str(engine), '--report', str(self._report)]
+                       '--request', str(request), '--request-token', reservation['request_token'],
+                       '--engine-dir', str(engine), '--report', str(self._report)]
             settings.last_report = str(self._report)
             settings.status = '正在后台烘焙 ' + folder + '…'
             return self._launch(context, command, root / 'cook.log')
         except Exception as error:
+            if reservation and (not hasattr(self, '_process') or self._process.poll() is not None):
+                from .cooking import cancel_cook_request
+                cancel_cook_request(reservation['request_path'], reservation['request_token'])
             settings.status = str(error)
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
@@ -1089,11 +1095,16 @@ class NTEBRIDGE_OT_select_cooked_assets(_WorkerModal, bpy.types.Operator):
             packager = settings.packager_source.strip() or detect_packager_source()
             if not packager or not settings.package_output.strip():
                 raise BridgeError('请选择 Mod 成品输出目录；无法自动找到打包器时请在高级设置指定。')
-            root = Path(settings.cook_report).parent / ('selection-' + new_id())
-            root.mkdir(exist_ok=False)
-            path = root / 'selection.json'
-            self._report = root / 'package_report.json'
-            write_json(path, selection)
+            from .cooking import lock_cook_report
+            # Another Blender may be replacing this role's current directory.
+            # Never recreate it between the backend's rename operations.
+            with lock_cook_report(selection['cook_report']):
+                selection = selection_request(settings)
+                root = Path(settings.cook_report).parent / 'current' / 'selections' / new_id()
+                root.mkdir(parents=True, exist_ok=False)
+                path = root / 'selection.json'
+                self._report = root / 'package_report.json'
+                write_json(path, selection)
             command = [str(worker_python()), str(Path(__file__).with_name('cli.py')), 'package-selection',
                        '--selection', str(path), '--packager-source', bpy.path.abspath(packager),
                        '--output-dir', bpy.path.abspath(settings.package_output), '--mod-name', settings.mod_name,

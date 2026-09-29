@@ -372,8 +372,19 @@ def stage_selection(selection_path, staging_parent=None):
     return result
 
 
+def exported_relative_path(staging, relative):
+    """Place the selected character directly in Characters; retain package paths in staging."""
+    from .core import package_path
+    folder = package_path(staging['character_folder'], '角色烘焙文件夹')
+    content = Path(staging['project_file']).stem + '/Content/'
+    prefix = content + folder[len('/Game/'):] + '/'
+    if folder.casefold() != '/game/characters' and relative.casefold().startswith(prefix.casefold()):
+        return content + 'Characters/' + PurePosixPath(folder).name + '/' + relative[len(prefix):]
+    return relative
+
+
 def export_selection(staging, export_directory):
-    """Mirror selected packages to the explicit Characters mount, never sweep xg."""
+    """Export the character folder directly under Characters, never sweep xg."""
     value = Path(export_directory)
     project = Path(staging['project_file']).stem
     if not value.is_absolute() or value.name.casefold() != 'characters' \
@@ -388,12 +399,17 @@ def export_selection(staging, export_directory):
     stage = Path(staging['source_dir']).resolve()
     if root.is_relative_to(cooked) or cooked.is_relative_to(root) or root.is_relative_to(stage) or stage.is_relative_to(root):
         raise BridgeError('导出目录不能与烘焙快照或打包暂存目录重叠。')
-    targets, stale = [], []
+    targets, stale, destination_paths = [], [], set()
     listed = {item['path'].casefold() for item in staging['files']}
     # Complete preflight before overwriting any previous exported file.
     for item in staging['files']:
         source = _inside(stage, item['path'])
-        destination = _inside(root, item['path'])
+        exported_relative = exported_relative_path(staging, item['path'])
+        destination = _inside(root, exported_relative)
+        destination_key = str(destination).casefold()
+        if destination_key in destination_paths:
+            raise BridgeError('不同资产映射到了同一个角色导出文件：' + str(destination))
+        destination_paths.add(destination_key)
         if not source.is_file() or source.stat().st_size != item['bytes'] or file_sha256(source) != item['sha256']:
             raise BridgeError('导出前暂存文件发生改变：' + item['path'])
         if destination.exists() and not destination.is_file():
@@ -403,19 +419,21 @@ def export_selection(staging, export_directory):
             if ancestor.exists() and not ancestor.is_dir():
                 raise BridgeError('导出目录被文件占用：' + str(ancestor))
             ancestor = ancestor.parent
-        targets.append((item, source, destination))
+        targets.append((item, source, destination, exported_relative))
     for asset in staging['selected_assets']:
         base = project + '/Content/' + asset[len('/Game/'):]
         for extension in SIDECARS:
             relative = base + extension
             if relative.casefold() not in listed:
-                previous = _inside(root, relative)
+                previous = _inside(root, exported_relative_path(staging, relative))
+                if str(previous).casefold() in destination_paths:
+                    raise BridgeError('角色导出路径与其他资产的旁文件冲突：' + str(previous))
                 if previous.exists():
                     if not previous.is_file():
                         raise BridgeError('旧旁文件路径被目录占用：' + str(previous))
                     stale.append(previous)
     exported = []
-    for item, source, destination in targets:
+    for item, source, destination, exported_relative in targets:
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(destination.name + '.' + uuid.uuid4().hex + '.tmp')
         try:
@@ -423,7 +441,7 @@ def export_selection(staging, export_directory):
             os.replace(temporary, destination)
         finally:
             temporary.unlink(missing_ok=True)
-        exported.append(dict(item, exported_path=str(destination)))
+        exported.append(dict(item, exported_path=str(destination), export_relative_path=exported_relative))
     # Only obsolete sidecars belonging to the selected package are removed.
     # Unselected packages stay in xg, and adapter input remains fresh staging.
     for previous in stale:
@@ -499,6 +517,16 @@ def _package_staging(staging, packager_source_dir, packager_tools_dir, output_di
 
 def package_selection(selection_path, packager_source_dir=None, packager_tools_dir=None,
                       output_dir=None, mod_name=None, timeout=1800, adapter_path=None, report_path=None):
+    """Hold the role cache while exporting and packaging its current snapshot."""
+    from .cooking import lock_cook_report
+    selection = json.loads(Path(selection_path).read_text(encoding='utf-8-sig'))
+    with lock_cook_report(selection.get('cook_report', '')):
+        return _package_selection_locked(selection_path, packager_source_dir, packager_tools_dir,
+                                         output_dir, mod_name, timeout, adapter_path, report_path)
+
+
+def _package_selection_locked(selection_path, packager_source_dir=None, packager_tools_dir=None,
+                              output_dir=None, mod_name=None, timeout=1800, adapter_path=None, report_path=None):
     """Export checked snapshot assets and package their fresh tree; never recook."""
     selection_path = Path(selection_path).resolve()
     report_path = Path(report_path or selection_path.with_name('selection_package_report.json')).resolve()

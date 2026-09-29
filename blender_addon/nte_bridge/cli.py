@@ -39,6 +39,7 @@ def main(argv=None):
     cook.add_argument('--request', required=True)
     cook.add_argument('--engine-dir', required=True)
     cook.add_argument('--report')
+    cook.add_argument('--request-token')
     cook.add_argument('--timeout', type=int, default=1800)
     selected = sub.add_parser('package-selection')
     selected.add_argument('--selection', required=True)
@@ -58,7 +59,8 @@ def main(argv=None):
         try:
             if args.command == 'cook':
                 from nte_bridge.cooking import cook_character
-                result = cook_character(args.request, args.engine_dir, report_path=report_path, timeout=args.timeout)
+                result = cook_character(args.request, args.engine_dir, report_path=report_path,
+                                        timeout=args.timeout, request_token=args.request_token)
             else:
                 from nte_bridge.packaging import package_selection
                 result = package_selection(args.selection, args.packager_source,

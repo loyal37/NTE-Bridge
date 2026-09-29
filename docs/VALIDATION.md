@@ -1,4 +1,17 @@
-# v0.3.0 验证记录
+# v0.3.1 验证记录
+
+日期：2026-09-29。使用指定的 Blender 4.5.7 LTS 与隔离 UE 5.6.1 工程。
+
+- 98 项纯 Python 测试通过。新增覆盖固定目录与工程/角色隔离、旧文件和打包暂存清理、失败保留、发布失败回滚、中断恢复、预约失效、同内容不同代报告失效、Windows 跨进程锁与进程退出解锁、真实 junction 越界拒绝，以及角色平铺导出、内部子目录、旧旁文件和目标冲突。
+- Blender 4.5.7 的 25 项烘焙/资产选择检查通过：相同角色复用请求与报告、其他角色隔离、预约防止覆盖运行中请求、启动失败释放预约、操作锁保护资产选择、重烘焙清除旧选择并载入新报告；原有筛选、禁选引用、导出位置和缓存失效行为保留。
+- 实际连续两次烘焙同一隔离 UE 角色，确认请求、报告和 cooked 路径一致；新烘焙身份替换旧身份，人为加入的过期文件及旧选择/打包暂存全部清除，最终仅保留 `current`。其间实际调用外部打包器生成成品，确认打包持有角色锁。第三次以不存在的引擎路径制造失败，报告明确失败，上次成功文件的全部指纹不变。工程描述与源资产前后未变。
+- 实际选中网格、漫射、法线、自定义 MI、Blueprint、AnimBlueprint 共 6 项、12 个文件，直接导出到 `Characters/BridgeFixture`，无 `Player` 层且保留角色内部子目录。外部打包成功，retoc 回读仍为精确 6 个原始 `/Game/Characters/Player/BridgeFixture/...` 包路径；原烘焙文件未变。
+- 用户已有 `Characters/Player/078_Nitsa` 已移动至 `Characters/078_Nitsa`，2 个文件 SHA256 全部一致，空 `Player` 目录已移除，另一角色不变。截图中的两份旧烘焙目录在检查时已清空，本次未重复删除。
+- 实测曾发现过长的缓存目录名触发 UE 的 260 字符输出路径限制，已改用短角色名加项目/角色身份哈希并重测通过。Windows 短暂文件占用使用有界重试；持续占用时保留目录所有权标记供下次恢复。
+
+本地证据：`artifacts/unit-v0.3.1.log`、`artifacts/cooking_ui_smoke/a6c846d63f/result.json`、`artifacts/recook_smoke/5924ba816b/result.json`、`artifacts/export_031/result.json`、`artifacts/export-path-migration-031.json`。仅更新 main，不创建标签或 Release；游戏内验证仍由后续实际使用确认。
+
+## v0.3.0 验证记录
 
 日期：2026-09-29。使用 Blender 4.5.7 LTS 和隔离 UE 5.6.1 工程。
 

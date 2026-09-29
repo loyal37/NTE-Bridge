@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / 'blender_addon'))
 import nte_bridge
 from nte_bridge import blender_ui, blender_packaging
 from nte_bridge.core import BridgeError, write_json
-from nte_bridge.cooking import snapshot_cooked
+from nte_bridge.cooking import cancel_cook_request, cook_cache_directory, lock_cook_report, snapshot_cooked
 
 
 def rejected(call, text):
@@ -47,6 +47,8 @@ def main():
     original_material = settings.material_catalog.add()
     original_material.asset_path = part.material_path
     role = '/Game/Characters/Player/078_Nitsa'
+    (project.parent / 'Content/Characters/Player/078_Nitsa').mkdir(parents=True)
+    (project.parent / 'Content/Characters/Player/OtherRole').mkdir(parents=True)
     checks = []
     assert blender_packaging.default_character_folder(settings) == role
     assert blender_packaging.resolved_project(settings) == project
@@ -85,6 +87,44 @@ def main():
     assert request_path.is_relative_to(Path(settings.cache_root) / 'Cooks')
     assert Path(command[0]).is_file() and 'python' in Path(command[0]).name.lower()
     checks.append('independent-cook-without-mesh-or-latest-send-uses-selected-cache-and-project')
+
+    request_before = request_path.read_bytes()
+    with patch.object(blender_ui._WorkerModal, '_launch') as second_launch:
+        try:
+            outcome = bpy.ops.nte_bridge.cook()
+            assert outcome == {'CANCELLED'}
+        except RuntimeError:
+            pass
+        second_launch.assert_not_called()
+    assert request_path.read_bytes() == request_before
+    cancel_cook_request(request_path, command[command.index('--request-token') + 1])
+    with patch.object(blender_ui._WorkerModal, '_launch', capture):
+        assert bpy.ops.nte_bridge.cook() == {'FINISHED'}
+    cook_operator, command, log = captured[-1]
+    assert Path(command[command.index('--request') + 1]) == request_path
+    assert request_path.parent == cook_cache_directory(Path(settings.cache_root), project, role)
+    cancel_cook_request(request_path, command[command.index('--request-token') + 1])
+    checks += ['same-project-role-reuses-request-and-report-directory', 'active-reservation-rejects-second-cook-without-overwriting-request']
+
+    settings.cook_use_custom = True
+    settings.cook_folder = '/Game/Characters/Player/OtherRole'
+    with patch.object(blender_ui._WorkerModal, '_launch', capture):
+        assert bpy.ops.nte_bridge.cook() == {'FINISHED'}
+    _, other_command, _ = captured[-1]
+    other_request = Path(other_command[other_command.index('--request') + 1])
+    assert other_request.parent != request_path.parent
+    cancel_cook_request(other_request, other_command[other_command.index('--request-token') + 1])
+    settings.cook_use_custom = False
+    checks.append('different-role-cooks-use-separate-stable-directories')
+
+    with patch.object(blender_ui._WorkerModal, '_launch', side_effect=OSError('fixture child launch failed')):
+        rejected(lambda: bpy.ops.nte_bridge.cook(), 'fixture child launch failed')
+    with patch.object(blender_ui._WorkerModal, '_launch', capture):
+        assert bpy.ops.nte_bridge.cook() == {'FINISHED'}
+    cook_operator, command, log = captured[-1]
+    assert Path(command[command.index('--request') + 1]) == request_path
+    cancel_cook_request(request_path, command[command.index('--request-token') + 1])
+    checks.append('child-launch-failure-releases-cook-reservation')
 
     cooked = request_path.parent / 'cook-fixture/Windows'
     specs = [('SM_Body', 'SkeletalMesh'), ('T_Body', 'Texture2D'), ('T_Hair', 'Texture2D'),
@@ -167,8 +207,17 @@ def main():
     assert selection['selected_assets'] == [role + '/T_Hair']
     assert selection['export_directory'] == str(Path(settings.cook_export_directory))
     assert selection['cook_report_sha256'] == hashlib.sha256(report_path.read_bytes()).hexdigest()
+    assert selection_path.is_relative_to(report_path.parent / 'current/selections')
     assert '--output-dir' in command and command[command.index('--output-dir') + 1] == settings.package_output
     checks += ['export-directory-and-explicit-selection-serialized', 'pack-selection-does-not-resolve-or-launch-ue']
+
+    selection_directory = report_path.parent / 'current/selections'
+    before_selections = {path.name for path in selection_directory.iterdir()}
+    with lock_cook_report(report_path), patch.object(blender_ui._WorkerModal, '_launch') as busy_launch:
+        rejected(lambda: bpy.ops.nte_bridge.select_cooked_assets(), '正在烘焙或打包')
+        busy_launch.assert_not_called()
+    assert {path.name for path in selection_directory.iterdir()} == before_selections
+    checks.append('active-role-lock-rejects-selection-before-writing-or-launching')
 
     # A blocked row cannot be smuggled through programmatic property assignment.
     blocked = next(entry for entry in settings.cook_assets if not entry.packable)
@@ -189,6 +238,23 @@ def main():
         assert width <= 1150 and width * scale <= pixels - 40 * scale
     checks.append('native-asset-list-and-dialog-api-registered-on-4-5-7')
     checks += ['first-visible-role-asset-active-not-hidden-dependency', 'dialog-width-fits-window-at-high-ui-scale']
+
+    previous_report_hash = settings.cook_report_sha256
+    settings.engine_dir = str(output / 'No editor launched')
+    with patch.object(blender_ui._WorkerModal, '_launch', capture):
+        assert bpy.ops.nte_bridge.cook() == {'FINISHED'}
+    recook_operator, recook_command, _ = captured[-1]
+    assert not settings.cook_report and not settings.cook_assets
+    assert Path(recook_command[recook_command.index('--request') + 1]) == request_path
+    assert Path(recook_command[recook_command.index('--report') + 1]) == report_path
+    cancel_cook_request(request_path, recook_command[recook_command.index('--request-token') + 1])
+    report['cook_id'] = report['job_id'] = str(uuid.uuid4())
+    write_json(report_path, report)
+    blender_ui.NTEBRIDGE_OT_cook._complete(recook_operator, 0)
+    assert settings.cook_report_sha256 != previous_report_hash
+    assert not any(entry.selected for entry in settings.cook_assets)
+    assert selection['cook_report_sha256'] != settings.cook_report_sha256
+    checks.append('recook-clears-selection-and-reloads-new-generation-at-same-report-path')
 
     for change in ('project', 'folder', 'cache', 'role'):
         blender_packaging.load_cooked_assets(settings, report_path)
