@@ -2,18 +2,21 @@
 
 from pathlib import Path
 import json
+import os
 import re
 import subprocess
+import time
 
 import bpy
 from bpy.app.handlers import persistent
-from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
 from .blender_export import finish_job, graph_dict, new_id, prepare_job, profile_manifest, release_job
 from .core import BridgeError, write_json
 from .discovery import scan_character
 from .workflow import detect_engine_dir, detect_packager_source
 from .blender_cache import _directory, ensure_cache, selected_manifest
+from . import blender_assets, blender_state
 from .blender_packaging import (TYPE_ITEMS, TYPE_LABELS, TYPE_ICONS, asset_dialog_width, asset_visible, character_folder,
     clear_cook, cook_excluded_assets, default_character_folder, load_cooked_assets, resolved_project,
     selection_request, size_label, verified_cook, visible_assets, worker_python)
@@ -82,7 +85,7 @@ class NTEBridgeCookedAssetEntry(bpy.types.PropertyGroup):
     asset_type: StringProperty()
     size_bytes: StringProperty()
     size_text: StringProperty()
-    selected: BoolProperty(name='导出此资产', default=False)
+    selected: BoolProperty(name='导出此资产', default=False, update=blender_state.selection_changed)
     packable: BoolProperty(default=False)
     dependency: BoolProperty(default=False)
     reason: StringProperty()
@@ -485,6 +488,13 @@ def _restore_cache(_unused=None):
                 verified_cook(settings)
             except (BridgeError, OSError, ValueError, KeyError):
                 clear_cook(settings)
+        blender_state.restore_session(settings)
+
+
+@persistent
+def _save_packaging_state(_unused=None):
+    for scene in bpy.data.scenes:
+        blender_state.remember(scene.nte_bridge)
 
 
 def _initialize_cache():
@@ -529,10 +539,10 @@ class NTEBridgeSettings(bpy.types.PropertyGroup):
         description="后台导入要求目标工程关闭；自动启动 UE 命令行编辑器，完成后退出",
         items=[('commandlet', '后台导入（无需打开 UE）', '目标工程必须关闭；自动启动后台 UE 并在导入完成后退出', 1),
                ('remote', '发送到已打开的 UE', '可选：需要目标工程启用本机 Python 远程执行', 0)])
-    packager_source: StringProperty(name="外部打包器目录", subtype='DIR_PATH',
+    packager_source: StringProperty(name="外部打包器目录", subtype='DIR_PATH', update=blender_state.changed,
         description="包含 NteMorphTargetPatch.exe、retoc.exe 和 Oodle DLL 的目录")
-    package_output: StringProperty(name="Mod 输出目录", subtype='DIR_PATH')
-    mod_name: StringProperty(name="Mod 名称", default='NTEBridgeMod')
+    package_output: StringProperty(name="Mod 输出目录", subtype='DIR_PATH', update=blender_state.changed)
+    mod_name: StringProperty(name="Mod 名称", default='NTEBridgeMod', update=blender_state.changed)
     cook_use_custom: BoolProperty(name='自定义 UE 烘焙目录', default=False, update=_cook_context_changed,
         description='默认烘焙当前角色的完整目录；开启后可选择工程中的其他目录')
     cook_folder: StringProperty(name='UE 烘焙目录', update=_cook_context_changed,
@@ -541,17 +551,21 @@ class NTEBridgeSettings(bpy.types.PropertyGroup):
     cook_report_sha256: StringProperty(options={'HIDDEN'})
     cook_assets: CollectionProperty(type=NTEBridgeCookedAssetEntry)
     cook_active_asset: IntProperty(min=0)
-    cook_search: StringProperty(name='搜索资产', description='按名称、类型或资源路径搜索')
-    cook_type: EnumProperty(name='资产类型', items=TYPE_ITEMS, default='ALL')
-    cook_show_dependencies: BoolProperty(name='显示目录外依赖', default=False,
+    cook_search: StringProperty(name='搜索资产', description='按名称、类型或资源路径搜索', update=blender_state.changed)
+    cook_type: EnumProperty(name='资产类型', items=TYPE_ITEMS, default='ALL', update=blender_state.changed)
+    cook_show_dependencies: BoolProperty(name='显示目录外依赖', default=False, update=blender_state.changed,
         description='显示烘焙时生成的共享资产及引擎依赖；不可打包的引用仍禁止勾选')
-    cook_export_directory: StringProperty(name='烘焙资产导出目录', subtype='DIR_PATH',
+    cook_export_directory: StringProperty(name='烘焙资产导出目录', subtype='DIR_PATH', update=blender_state.changed,
         default='D:/Neverness to Everness Mod Loader/cook/packager/xg/HT/Content/Characters',
         description='角色文件夹直接导出到此目录，如 Characters/078_Nitsa；保留角色内部子目录，随后自动打包')
     last_manifest: StringProperty(name="最近任务", subtype='FILE_PATH')
     last_report: StringProperty(name="最近报告", subtype='FILE_PATH')
     status: StringProperty(default='先读取解包的角色文件夹，再选择 Blender 网格。')
     busy: BoolProperty(default=False, options={'SKIP_SAVE'})
+    progress_text: StringProperty(options={'SKIP_SAVE'})
+    progress_factor: FloatProperty(default=-1.0, min=-1.0, max=1.0, options={'SKIP_SAVE'})
+    elapsed: FloatProperty(default=0.0, options={'SKIP_SAVE'})
+    task_error: BoolProperty(default=False, options={'SKIP_SAVE'})
 
 
 class NTEBRIDGE_OT_scan_character(bpy.types.Operator):
@@ -824,21 +838,47 @@ class _WorkerModal:
     def poll(cls, context):
         return not context.scene.nte_bridge.busy
 
+    def _preparing(self, context, text):
+        self._settings = context.scene.nte_bridge
+        self._started = time.monotonic()
+        self._settings.busy = True
+        self._settings.task_error = False
+        self._settings.progress_text = text
+        self._settings.progress_factor = -1.0
+        self._settings.elapsed = 0.0
+        blender_assets.refresh()
+        if not bpy.app.background:
+            bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+
     def _spawn(self, command, log_path):
+        self._progress_path = Path(log_path).with_name('progress.json')
+        self._progress_token = new_id()
+        self._settings.progress_text = self._settings.status
+        self._settings.progress_factor = -1.0
+        environment = dict(os.environ, NTE_BRIDGE_PROGRESS=str(self._progress_path),
+                           NTE_BRIDGE_PROGRESS_TOKEN=self._progress_token)
         self._log = Path(log_path).open('w', encoding='utf-8')
         try:
             self._process = subprocess.Popen(command, stdout=self._log, stderr=subprocess.STDOUT,
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), env=environment)
         except Exception:
             self._log.close()
             raise
 
     def _launch(self, context, command, log_path):
         self._settings = context.scene.nte_bridge
+        self._started = getattr(self, '_started', time.monotonic())
+        self._settings.task_error = False
+        self._settings.elapsed = 0.0
         self._spawn(command, log_path)
         self._settings.busy = True
-        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
-        context.window_manager.modal_handler_add(self)
+        # A user may close the asset window manually. Keep the worker's handler
+        # in its originating Blender window so completion still releases busy.
+        owner = blender_assets.worker_window(context.window)
+        self._timer = context.window_manager.event_timer_add(0.25, window=owner)
+        with context.temp_override(window=owner):
+            context.window_manager.modal_handler_add(self)
+        blender_assets.refresh()
         return {'RUNNING_MODAL'}
 
     def _release_workspace(self):
@@ -847,11 +887,21 @@ class _WorkerModal:
         if lock:
             self._job_lock = None
             lock.__exit__(None, None, None)
+        if hasattr(self, '_settings'):
+            self._settings.busy = False
 
     def modal(self, context, event):
         if event.type == 'ESC':
             self.report({'WARNING'}, '任务进行中；取消请使用任务进程，不在写入中强制关闭。')
-        if event.type != 'TIMER' or self._process.poll() is None:
+        if event.type != 'TIMER' or getattr(event, 'timer', self._timer) != self._timer:
+            return {'PASS_THROUGH'}
+        from .progress import read_progress
+        self._settings.elapsed = time.monotonic() - self._started
+        progress = read_progress(self._progress_path, self._progress_token)
+        if progress:
+            self._settings.progress_text, self._settings.progress_factor = progress
+        blender_assets.refresh()
+        if self._process.poll() is None:
             return {'PASS_THROUGH'}
         self._log.close()
         try:
@@ -864,10 +914,16 @@ class _WorkerModal:
             result, report_type = {'FINISHED'}, {'INFO'}
         except Exception as error:
             self._settings.status = str(error)
+            self._settings.task_error = True
             result, report_type = {'CANCELLED'}, {'ERROR'}
         self._release_workspace()
         context.window_manager.event_timer_remove(self._timer)
         self._settings.busy = False
+        self._settings.progress_factor = 1.0 if result == {'FINISHED'} else -1.0
+        self._settings.progress_text = self._settings.status
+        if result == {'FINISHED'} and getattr(self, '_asset_window', None):
+            blender_assets.close_later(self._asset_window)
+        blender_assets.refresh()
         if context.area:
             context.area.tag_redraw()
         self.report(report_type, self._settings.status)
@@ -886,6 +942,7 @@ class NTEBRIDGE_OT_export(_WorkerModal, bpy.types.Operator):
         try:
             _ensure_source_current(settings)
             _job_defaults(settings)
+            self._preparing(context, '准备模型导出副本')
             self._job = prepare_job(context)
             settings.status = '正在后台导出 FBX 临时副本…'
             return self._launch(context, self._job['command'], self._job['job_dir'] / 'export.log')
@@ -917,6 +974,7 @@ class NTEBRIDGE_OT_send(_WorkerModal, bpy.types.Operator):
             self._engine, self._python = _engine_path(settings)
             self._sync_mode = settings.sync_mode
             _job_defaults(settings)
+            self._preparing(context, '准备模型与贴图副本')
             self._job = prepare_job(context)
             self._phase = 'export'
             settings.status = '1/2 正在导出当前模型…'
@@ -1067,9 +1125,11 @@ class NTEBRIDGE_OT_select_filtered_cooked(bpy.types.Operator):
 
     def execute(self, context):
         settings = context.scene.nte_bridge
-        for entry in visible_assets(settings):
-            if entry.packable:
-                entry.selected = self.action == 'ALL'
+        with blender_state.suspend():
+            for entry in visible_assets(settings):
+                if entry.packable:
+                    entry.selected = self.action == 'ALL'
+        blender_state.remember(settings)
         return {'FINISHED'}
 
 
@@ -1100,8 +1160,9 @@ class NTEBRIDGE_OT_select_cooked_assets(_WorkerModal, bpy.types.Operator):
     def invoke(self, context, event):
         try:
             verified_cook(context.scene.nte_bridge)
-            return context.window_manager.invoke_props_dialog(self, width=asset_dialog_width(context),
-                confirm_text='导出所选资产并打包', title='烘焙资产 · 选择导出')
+            blender_state.restore_choices(context.scene.nte_bridge)
+            blender_assets.open_window(context)
+            return {'FINISHED'}
         except Exception as error:
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
@@ -1127,16 +1188,13 @@ class NTEBRIDGE_OT_select_cooked_assets(_WorkerModal, bpy.types.Operator):
         layout.template_list('NTEBRIDGE_UL_cooked_assets', '', settings, 'cook_assets', settings,
                              'cook_active_asset', rows=12, maxrows=16)
         selected = [entry for entry in settings.cook_assets if entry.selected and entry.packable]
-        layout.label(text='当前显示 %d 项 · 已选 %d 项 · 总可选 %d 项 · %s' % (
-            len(visible_assets(settings)), len(selected), sum(entry.packable for entry in settings.cook_assets),
+        layout.label(text='已选 %d 项 · %s' % (
+            len(selected),
             size_label(sum(int(entry.size_bytes) for entry in selected))))
-        layout.label(text='原母材质、骨架和物理占位不可选；隐藏的已选资产仍包含在本次导出中', icon='INFO')
         if settings.cook_assets and settings.cook_active_asset < len(settings.cook_assets):
             active = settings.cook_assets[settings.cook_active_asset]
-            if asset_visible(settings, active):
-                layout.label(text=active.asset_path, icon='FILE_FOLDER')
-                if active.reason:
-                    layout.label(text=active.reason, icon='INFO' if active.packable else 'LOCKED')
+            if asset_visible(settings, active) and not active.packable and active.reason:
+                layout.label(text=active.reason, icon='LOCKED')
         layout.separator()
         _wide_prop(layout, settings, 'cook_export_directory')
         _wide_prop(layout, settings, 'package_output', 'Mod 成品输出目录')
@@ -1145,6 +1203,8 @@ class NTEBRIDGE_OT_select_cooked_assets(_WorkerModal, bpy.types.Operator):
     def execute(self, context):
         settings = context.scene.nte_bridge
         try:
+            blender_state.remember(settings)
+            self._asset_window = context.window.as_pointer() if blender_assets.is_asset_window(context.window) else None
             selection = selection_request(settings)
             packager = settings.packager_source.strip() or detect_packager_source()
             if not packager or not settings.package_output.strip():
@@ -1169,12 +1229,51 @@ class NTEBRIDGE_OT_select_cooked_assets(_WorkerModal, bpy.types.Operator):
             return self._launch(context, command, root / 'package.log')
         except Exception as error:
             settings.status = str(error)
+            settings.task_error = True
+            blender_assets.refresh()
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
 
     def _complete(self, code):
         _completed_report(self._settings, self._report, code)
         self._settings.status = '所选资产已导出并打包完成。'
+
+
+class NTEBRIDGE_OT_asset_dialog(bpy.types.Operator):
+    bl_idname = 'nte_bridge.asset_dialog'
+    bl_label = '烘焙资产 · 选择导出'
+    bl_options = {'INTERNAL'}
+
+    def invoke(self, context, event):
+        self._window = context.window.as_pointer()
+        return context.window_manager.invoke_props_dialog(self, width=asset_dialog_width(context), title=self.bl_label)
+
+    def draw(self, context):
+        blender_assets.remember_popup(context)
+        settings = context.scene.nte_bridge
+        column = self.layout.column()
+        column.enabled = not settings.busy
+        from types import SimpleNamespace
+        NTEBRIDGE_OT_select_cooked_assets.draw(SimpleNamespace(layout=column), context)
+        self.layout.separator()
+        if settings.busy:
+            _draw_progress(self.layout, settings)
+        elif settings.task_error:
+            _wrapped(self.layout, settings.status, context, 'ERROR')
+        row = self.layout.row()
+        row.enabled = not settings.busy
+        row.operator_context = 'EXEC_DEFAULT'
+        row.operator('nte_bridge.select_cooked_assets', text='导出所选资产并打包', icon='PACKAGE')
+        footer = self.layout.column()
+        footer.enabled = not settings.busy
+        footer.template_popup_confirm('', text='', cancel_text='关闭')
+
+    def execute(self, context):
+        blender_assets.close_later(self._window)
+        return {'FINISHED'}
+
+    def cancel(self, context):
+        blender_assets.close_later(self._window)
 
 
 class NTEBRIDGE_UL_parts(bpy.types.UIList):
@@ -1216,6 +1315,15 @@ def _panel_column(panel, context):
     return column
 
 
+def _draw_progress(layout, settings):
+    box = layout.box()
+    box.label(text=settings.progress_text or settings.status, icon='TIME')
+    seconds = int(settings.elapsed)
+    box.label(text='已用时间 %02d:%02d' % (seconds // 60, seconds % 60))
+    if settings.progress_factor >= 0:
+        box.progress(factor=settings.progress_factor, type='BAR', text='%d%%' % (settings.progress_factor * 100))
+
+
 def _material_details(layout, entry, context):
     if not entry:
         return
@@ -1238,6 +1346,10 @@ class NTEBRIDGE_PT_main(bpy.types.Panel):
 
     def draw(self, context):
         settings = context.scene.nte_bridge
+        if settings.busy:
+            _draw_progress(self.layout, settings)
+        elif settings.task_error:
+            _wrapped(self.layout, settings.status, context, 'ERROR')
         column = _panel_column(self, context)
         _wide_prop(column, settings, 'source_folder')
         column.operator('nte_bridge.scan_character', icon='FILE_REFRESH')
@@ -1339,14 +1451,9 @@ class NTEBRIDGE_PT_textures(_NTEChildPanel, bpy.types.Panel):
     def draw(self, context):
         settings = context.scene.nte_bridge
         column = _panel_column(self, context)
-        column.label(text='已连接的漫射自动用于 UE 预览')
-        column.label(text='其他需要导入 UE 的贴图在这里添加')
-        column.label(text='是否打包在烘焙资产窗口选择')
         if settings.textures:
             column.template_list('NTEBRIDGE_UL_textures', '', settings, 'textures', settings, 'active_texture',
                                  rows=min(4, max(2, len(settings.textures))))
-        else:
-            column.label(text='沿用原贴图时无需添加')
         row = column.row(align=True)
         row.operator('nte_bridge.edit_texture', text='添加贴图', icon='ADD').action = 'ADD'
         if settings.textures:
@@ -1365,7 +1472,7 @@ class NTEBRIDGE_PT_nodes(_NTEChildPanel, bpy.types.Panel):
 
     def draw(self, context):
         column = _panel_column(self, context)
-        _wrapped(column, '节点目前用于配置预览，接入运行时生成后才能打包切换功能。', context, 'INFO')
+        column.label(text='仅配置预览，尚未生成 UE 功能', icon='INFO')
         column.operator('nte_bridge.open_graph', icon='NODETREE')
         column.operator('nte_bridge.validate', icon='CHECKMARK')
 
@@ -1384,7 +1491,6 @@ class NTEBRIDGE_PT_send(_NTEChildPanel, bpy.types.Panel):
         row = column.row()
         row.scale_y = 1.3
         row.operator('nte_bridge.send', text='发送到 UE', icon='EXPORT')
-        _wrapped(self.layout, settings.status, context, 'TIME' if settings.busy else 'INFO')
 
 
 class NTEBRIDGE_PT_package(_NTEChildPanel, bpy.types.Panel):
@@ -1420,18 +1526,16 @@ class NTEBRIDGE_PT_advanced(_NTEChildPanel, bpy.types.Panel):
         settings = context.scene.nte_bridge
         column = _panel_column(self, context)
         _wide_prop(column, settings, 'cache_root')
-        column.label(text='任务、报告和临时文件统一存放')
-        column.label(text='留空时自动选择非 C 盘位置')
         paths = column.column()
         paths.enabled = False
         _wide_prop(paths, settings, 'job_root')
         column.separator()
-        column.label(text='资源路径（从角色资料自动读取）')
+        column.label(text='原资源路径')
         for prop in ('mesh_path', 'skeleton_path', 'physics_path'):
             _wide_prop(column, settings, prop)
         column.prop(settings, 'create_placeholders')
         column.separator()
-        column.label(text='工具路径（留空时自动查找）')
+        column.label(text='工具路径')
         for prop in ('engine_dir', 'packager_source'):
             _wide_prop(column, settings, prop)
         column.separator()
@@ -1467,7 +1571,7 @@ CLASSES = (NTEBridgePartEntry, NTEBridgeSourceMeshEntry, NTEBridgeMaterialEntry,
            NTEBRIDGE_OT_refresh_slots, NTEBRIDGE_OT_source_report, NTEBRIDGE_OT_edit_state,
            NTEBRIDGE_OT_edit_texture, NTEBRIDGE_OT_open_graph, NTEBRIDGE_OT_validate,
            NTEBRIDGE_OT_export, NTEBRIDGE_OT_send, NTEBRIDGE_OT_worker, NTEBRIDGE_UL_parts,
-           NTEBRIDGE_OT_choose_cook_folder, NTEBRIDGE_OT_cook, NTEBRIDGE_OT_select_filtered_cooked, NTEBRIDGE_UL_cooked_assets, NTEBRIDGE_OT_select_cooked_assets,
+           NTEBRIDGE_OT_choose_cook_folder, NTEBRIDGE_OT_cook, NTEBRIDGE_OT_select_filtered_cooked, NTEBRIDGE_UL_cooked_assets, NTEBRIDGE_OT_select_cooked_assets, NTEBRIDGE_OT_asset_dialog,
            NTEBRIDGE_UL_textures, NTEBRIDGE_PT_main, NTEBRIDGE_PT_materials,
            NTEBRIDGE_PT_catalog, NTEBRIDGE_PT_textures, NTEBRIDGE_PT_nodes,
            NTEBRIDGE_PT_send, NTEBRIDGE_PT_package, NTEBRIDGE_PT_advanced)
@@ -1478,6 +1582,7 @@ def register():
     bpy.types.Scene.nte_bridge = PointerProperty(type=NTEBridgeSettings)
     bpy.types.NODE_MT_add.append(_add_menu)
     bpy.app.handlers.load_post.append(_restore_cache)
+    bpy.app.handlers.save_post.append(_save_packaging_state)
     if hasattr(bpy.data, 'scenes'):
         _restore_cache()
     else:
@@ -1485,10 +1590,13 @@ def register():
 
 
 def unregister():
+    blender_assets.unregister()
     if bpy.app.timers.is_registered(_initialize_cache):
         bpy.app.timers.unregister(_initialize_cache)
     if _restore_cache in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_restore_cache)
+    if _save_packaging_state in bpy.app.handlers.save_post:
+        bpy.app.handlers.save_post.remove(_save_packaging_state)
     bpy.types.NODE_MT_add.remove(_add_menu)
     if hasattr(bpy.types.Scene, 'nte_bridge'):
         del bpy.types.Scene.nte_bridge

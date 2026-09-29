@@ -274,9 +274,9 @@ def main():
     write_json(report_path, report)
     blender_ui.NTEBRIDGE_OT_cook._complete(recook_operator, 0)
     assert settings.cook_report_sha256 != previous_report_hash
-    assert not any(entry.selected for entry in settings.cook_assets)
+    assert [entry.asset_path for entry in settings.cook_assets if entry.selected] == [role + '/T_Hair']
     assert selection['cook_report_sha256'] != settings.cook_report_sha256
-    checks.append('recook-clears-selection-and-reloads-new-generation-at-same-report-path')
+    checks.append('recook-rebinds-remembered-choices-to-new-generation-at-same-report-path')
 
     for change in ('project', 'folder', 'cache', 'role'):
         blender_packaging.load_cooked_assets(settings, report_path)

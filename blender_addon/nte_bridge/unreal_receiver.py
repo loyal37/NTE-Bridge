@@ -205,6 +205,8 @@ def _apply_material_preview(unreal, material, texture, newly_created, report):
 
 
 def _run(unreal, manifest, job_dir, report):
+    from .progress import report_progress
+    report_progress('UE 已启动，检查角色资产与材质引用')
     current_project = unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path())
     report["project_file"] = _canonical_file(current_project)
     if _canonical_file(current_project) != _canonical_file(manifest["project_file"]):
@@ -301,6 +303,7 @@ def _run(unreal, manifest, job_dir, report):
         if unreal.SystemLibrary.get_console_variable_int_value(cvar) != 0:
             raise BridgeError("Could not select the legacy FBX importer")
         report["mutation_started"] = True
+        report_progress('UE 正在导入 FBX 网格与形态键')
         imported = _task(unreal, resolve_source(job_dir, mesh_spec["source_file"]),
                          mesh_spec["asset_path"], unreal.FbxFactory(), options)
     finally:
@@ -361,8 +364,11 @@ def _run(unreal, manifest, job_dir, report):
     report["slot_signature"] = hashlib.sha256(
         repr(sorted(slot_indices.items())).encode("utf-8")).hexdigest()
 
+    report_progress('检查网格材质槽、骨架、UV 与形态键')
     textures = {}
-    for entry in manifest.get("textures", []):
+    entries = manifest.get("textures", [])
+    for index, entry in enumerate(entries):
+        report_progress('UE 导入贴图：' + entry['asset_path'].rsplit('/', 1)[-1], index, len(entries))
         _task(unreal, resolve_source(job_dir, entry["source_file"]), entry["asset_path"], unreal.TextureFactory())
         texture = _asset(unreal, entry["asset_path"], unreal.Texture2D)
         if texture is None:
@@ -391,7 +397,8 @@ def _run(unreal, manifest, job_dir, report):
 
     if _source_hashes(manifest, job_dir) != report["source_sha256"]:
         raise BridgeError("Source files changed during import; save and packaging stopped")
-    for record in report["assets"]:
+    for index, record in enumerate(report["assets"]):
+        report_progress('UE 编译并保存资产', index, len(report['assets']))
         asset, needs_save = touched[record["asset_path"]]
         if needs_save:
             if not unreal.EditorAssetLibrary.save_loaded_asset(asset, only_if_is_dirty=False):

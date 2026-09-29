@@ -7,7 +7,7 @@ import re
 import tempfile
 
 SCHEMA_VERSION = 1
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 HIDDEN_STATE = "$hidden"
 
 

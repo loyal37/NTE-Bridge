@@ -5,9 +5,13 @@ from pathlib import Path
 
 import bpy
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from nte_bridge.progress import report_progress
+
 
 def main():
     source, target = sys.argv[sys.argv.index('--') + 1:]
+    report_progress('读取模型导出副本')
     bpy.ops.wm.open_mainfile(filepath=source, load_ui=False, use_scripts=False)
     scenes = [s for s in bpy.data.scenes if s.name.startswith('NTEBridgeExport')]
     if len(scenes) != 1:
@@ -30,6 +34,7 @@ def main():
     mesh.select_set(True)
     rig.select_set(True)
     bpy.context.view_layer.objects.active = mesh
+    report_progress('导出 FBX 网格、骨架与形态键')
     result = bpy.ops.export_scene.fbx(
         filepath=target, use_selection=True, object_types={'MESH', 'ARMATURE'},
         use_mesh_modifiers=False, add_leaf_bones=False, bake_anim=False,
@@ -41,6 +46,7 @@ def main():
     if result != {'FINISHED'} or not Path(target).is_file():
         raise RuntimeError("FBX export did not produce a file")
     print('NTE_BRIDGE_FBX_EXPORT_OK', flush=True)
+    report_progress('FBX 导出完成，准备发送到 UE')
 
 
 if __name__ == '__main__':

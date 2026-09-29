@@ -7,6 +7,7 @@ import bpy
 
 from .blender_cache import cache_location, ensure_cache
 from .core import BridgeError, package_path
+from .blender_state import restore_choices, suspend
 
 
 TYPE_ITEMS = [('ALL', '全部类型', ''), ('SkeletalMesh', '骨骼网格', ''), ('Texture2D', '贴图', ''),
@@ -20,10 +21,11 @@ TYPE_ICONS = {'SkeletalMesh': 'OUTLINER_OB_MESH', 'Texture2D': 'IMAGE_DATA',
 
 
 def clear_cook(settings):
-    settings.cook_report = ''
-    settings.cook_report_sha256 = ''
-    settings.cook_assets.clear()
-    settings.cook_active_asset = 0
+    with suspend():
+        settings.cook_report = ''
+        settings.cook_report_sha256 = ''
+        settings.cook_assets.clear()
+        settings.cook_active_asset = 0
 
 
 def resolved_project(settings):
@@ -124,9 +126,11 @@ def load_cooked_assets(settings, report_path):
         entry.packable = bool(asset['packable'])
         entry.dependency = bool(asset.get('dependency', False))
         entry.reason = asset.get('reason', '')
-        entry.selected = False
+        with suspend():
+            entry.selected = False
     settings.cook_active_asset = next((index for index, entry in enumerate(settings.cook_assets)
                                       if asset_visible(settings, entry)), 0)
+    restore_choices(settings)
     return report
 
 

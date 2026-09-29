@@ -17,6 +17,7 @@ def run(fixture_path, engine, packager):
     fixture_path = Path(fixture_path).resolve()
     assert fixture_path.is_relative_to((ROOT / 'artifacts/cooking_fixture').resolve())
     fixture = json.loads(fixture_path.read_text(encoding='utf-8'))
+    assert {'project_file', 'character_root', 'source_hashes'} <= fixture.keys(), 'Use fixture.json'
     base = ROOT / 'artifacts/shared_cook_smoke' / uuid.uuid4().hex[:10]
     base.mkdir(parents=True)
     project = Path(fixture['project_file'])

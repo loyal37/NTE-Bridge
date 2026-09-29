@@ -12,7 +12,8 @@ import time
 import uuid
 
 from .core import BridgeError, package_path, write_json
-from .packaging import SIDECARS, _inside, _run, _unreal_command_line, file_sha256
+from .packaging import SIDECARS, _inside, _relative_path, _run, _unreal_command_line, file_sha256
+from .progress import report_progress
 
 PACKABLE_CLASSES = {
     'SkeletalMesh', 'StaticMesh', 'Texture2D', 'TextureCube', 'Texture2DArray', 'VolumeTexture',
@@ -288,24 +289,47 @@ def _packable(path, asset_type, excluded):
     return True, ''
 
 
-def _inventory(root):
+def _inventory(root, hash_cache=None):
     root = Path(root).resolve()
     files = []
     if not root.is_dir():
         raise BridgeError('烘焙目录不存在：' + str(root))
-    for path in sorted(root.rglob('*')):
+    cached = {}
+    if hash_cache and Path(hash_cache).is_file():
+        try:
+            saved = json.loads(Path(hash_cache).read_text(encoding='utf-8'))
+            if isinstance(saved, dict) and saved.get('root') == str(root) and isinstance(saved.get('files'), dict):
+                cached = saved.get('files', {})
+        except (OSError, ValueError, TypeError):
+            pass
+    updated = {}
+    paths = sorted(root.rglob('*'))
+    for index, path in enumerate(paths):
+        if index % 32 == 0:
+            report_progress('整理烘焙结果', index, len(paths))
         if path.is_file():
             relative = path.relative_to(root).as_posix()
             actual = _inside(root, relative)
-            files.append({'path': relative, 'bytes': actual.stat().st_size, 'sha256': file_sha256(actual)})
+            state = actual.stat()
+            stamp = [state.st_size, state.st_mtime_ns, state.st_ctime_ns, state.st_ino, state.st_dev]
+            prior = cached.get(relative, {})
+            if not isinstance(prior, dict):
+                prior = {}
+            digest = prior.get('sha256') if prior.get('stamp') == stamp else None
+            if not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}', digest):
+                digest = file_sha256(actual)
+            updated[relative] = {'stamp': stamp, 'sha256': digest}
+            files.append({'path': relative, 'bytes': state.st_size, 'sha256': digest})
+    if hash_cache:
+        write_json(hash_cache, {'root': str(root), 'files': updated})
     return files
 
 
-def snapshot_cooked(request, catalog, cooked_root, cook_id, request_hash):
+def snapshot_cooked(request, catalog, cooked_root, cook_id, request_hash, hash_cache=None):
     """Inventory every cooked file, including non-package auxiliary output."""
     project = Path(request['project_file'])
     root = Path(cooked_root).resolve()
-    files = _inventory(root)
+    files = _inventory(root, hash_cache)
     by_path = {item['path'].casefold(): item for item in files}
     types = {item['asset_path'].casefold(): item for item in catalog['assets']}
     excluded = {path.casefold() for path in request.get('excluded_assets', [])}
@@ -387,7 +411,7 @@ def load_cook_report(path, expected_sha256=None, verify_files=False):
     for item in files:
         if not isinstance(item, dict) or not isinstance(item.get('path'), str):
             raise BridgeError('烘焙文件记录无效。')
-        _inside(root, item['path'])
+        _relative_path(item['path'])
         if item['path'].casefold() in inventory or type(item.get('bytes')) is not int or item['bytes'] < 0 \
                 or not re.fullmatch('[0-9a-fA-F]{64}', item.get('sha256', '')):
             raise BridgeError('烘焙文件快照有重复路径或无效指纹。')
@@ -457,6 +481,7 @@ def _cook_shared(request_path, request, editor, run_root, metadata, result, time
         runner.write_text('import sys\nsys.path.insert(0, %r)\nfrom nte_bridge.unreal_catalog import run\nrun(%r, %r)\n' %
                           (module_root, str(request_path), str(catalog_path)), encoding='utf-8')
         result['phase'] = 'catalog'
+        report_progress('启动 UE 后台，读取工程资产目录', log=run_root / 'catalog.log')
         environment = dict(os.environ)
         temporary = _managed_directory(run_root, 'temp', metadata)
         environment.update({key: str(temporary) for key in ('TEMP', 'TMP', 'TMPDIR')})
@@ -473,6 +498,7 @@ def _cook_shared(request_path, request, editor, run_root, metadata, result, time
         if _project_editor_running(request['project_file']):
             raise BridgeError('目标 UE 工程在扫描后被打开，请关闭后重新烘焙。')
         result['phase'] = 'cook'
+        report_progress('UE 正在增量烘焙角色目录', log=run_root / 'cook-commandlet.log')
         output = _managed_directory(run_root, 'cooked', metadata)
         _inside(output, 'Windows')  # Reject an externally redirected platform root before UE writes.
         directory = _inside(Path(request['project_file']).parent / 'Content', request['character_folder'][len('/Game/'):])
@@ -486,7 +512,8 @@ def _cook_shared(request_path, request, editor, run_root, metadata, result, time
             raise BridgeError('烘焙没有生成预期的工程 Content 文件。')
         if file_sha256(request_path) != result['manifest_sha256']:
             raise BridgeError('烘焙过程中请求发生了改变。')
-        result = snapshot_cooked(request, catalog, cooked_root, cook_id, result['manifest_sha256'])
+        result = snapshot_cooked(request, catalog, cooked_root, cook_id, result['manifest_sha256'],
+                                 hash_cache=run_root / 'cook_hashes.json')
         result.update(run_dir=str(run_root), request_file=str(request_path), catalog_report=str(catalog_path))
     except Exception as error:
         result.update(success=False)

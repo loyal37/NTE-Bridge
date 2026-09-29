@@ -15,10 +15,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 
 from .core import BridgeError, load_manifest, resolve_source, write_json
-from .workspace import owned_directory
+from .workspace import _plain_directory, _retry_remove, directory_lock, owned_directory
+from .progress import report_progress
 
 SIDECARS = (".uasset", ".uexp", ".ubulk", ".uptnl")
 PACKABLE_TYPES = {"SkeletalMesh", "Texture2D"}
@@ -32,13 +34,18 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+def _relative_path(relative):
+    """Validate snapshot names without touching unrelated cooked files."""
+    value = str(relative).replace("\\", "/")
+    if not value or ":" in value or any(p in ("", ".", "..") for p in value.split("/")):
+        raise BridgeError("Unsafe relative path: " + value)
+    return value
+
+
 def _inside(root, relative):
     """Resolve a strict relative path, including symlinks/junctions."""
     root = Path(root).resolve()
-    value = str(relative).replace("\\", "/")
-    parts = PurePosixPath(value).parts
-    if not parts or value.startswith("/") or ":" in value or any(p in (".", "..") for p in parts):
-        raise BridgeError("Unsafe relative path: " + value)
+    value = _relative_path(relative)
     target = (root / value).resolve()
     if not target.is_relative_to(root):
         raise BridgeError("Path escapes its root: " + value)
@@ -285,13 +292,14 @@ def stage_selection(selection_path, staging_parent=None):
     from .cooking import load_cook_report, _packable
     from .core import package_path
     selection_path = Path(selection_path).resolve()
+    report_progress('校验本次资产选择')
     selection = json.loads(selection_path.read_text(encoding='utf-8-sig'))
     if selection.get('schema_version') != 1:
         raise BridgeError('不支持的资产选择格式。')
     report_path = Path(selection.get('cook_report', ''))
     if not report_path.is_absolute() or not re.fullmatch('[0-9a-fA-F]{64}', selection.get('cook_report_sha256', '')):
         raise BridgeError('资产选择必须指定烘焙报告绝对路径及其 SHA256。')
-    report = load_cook_report(report_path, selection['cook_report_sha256'], verify_files=True)
+    report = load_cook_report(report_path, selection['cook_report_sha256'], verify_files=False)
     selected = selection.get('selected_assets')
     if not isinstance(selected, list) or not selected:
         raise BridgeError('请先勾选需要导出的烘焙资产。')
@@ -316,6 +324,18 @@ def stage_selection(selection_path, staging_parent=None):
         assets.append(asset['asset_path'])
         files.extend(asset['files'])
     cooked = Path(report['cooked_root']).resolve()
+    # Validate only selected packages. Copy/hash below still proves every byte;
+    # examining their sibling sidecars detects additions omitted by the report.
+    for asset_path in assets:
+        asset = catalog[asset_path.casefold()]
+        main = next(item for item in asset['files'] if item['path'].lower().endswith('.uasset'))
+        source = _inside(cooked, main['path'])
+        expected = {PurePosixPath(item['path']).name.casefold() for item in asset['files']}
+        actual = {entry.name.casefold() for entry in source.parent.iterdir()
+                  if entry.stem.casefold() == source.stem.casefold()
+                  and entry.suffix.lower() in SIDECARS + ('.umap',)}
+        if expected != actual:
+            raise BridgeError('勾选资产的文件已被增加、删除或修改，请重新烘焙：' + asset_path)
     parent = Path(staging_parent or selection_path.parent / 'packaging').resolve()
     if parent.is_relative_to(cooked):
         raise BridgeError('打包暂存目录不能放在烘焙快照中。')
@@ -323,13 +343,14 @@ def stage_selection(selection_path, staging_parent=None):
     run_dir = owned_directory(parent / 'stage', 'NTEBridgePackageStage', reset=True)
     source_dir = run_dir / 'staging'
     source_dir.mkdir()
-    for item in files:
+    for index, item in enumerate(files):
+        report_progress('复制并校验所选资产', index, len(files))
         source = _inside(cooked, item['path'])
         destination = _inside(source_dir, item['path'])
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
         if destination.stat().st_size != item['bytes'] or file_sha256(destination) != item['sha256']:
-            raise BridgeError('复制过程中烘焙文件发生改变：' + item['path'])
+            raise BridgeError('勾选资产的文件已被增加、删除或修改，请重新烘焙：' + item['path'])
     result = {'schema_version': 1, 'job_id': report['cook_id'], 'cook_id': report['cook_id'],
               'manifest_sha256': report['manifest_sha256'], 'run_id': str(uuid.uuid4()),
               'project_file': report['project_file'], 'character_folder': report['character_folder'],
@@ -351,14 +372,14 @@ def exported_relative_path(staging, relative):
     return relative
 
 
-def export_selection(staging, export_directory):
-    """Export the character folder directly under Characters, never sweep xg."""
+def _export_directories(staging, export_directory):
+    from .core import package_path
     value = Path(export_directory)
     project = Path(staging['project_file']).stem
     if not value.is_absolute() or value.name.casefold() != 'characters' \
             or value.parent.name.casefold() != 'content' or value.parent.parent.name.casefold() != project.casefold():
         raise BridgeError('导出目录应为 <打包器>/xg/%s/Content/Characters；保持工程挂载名和 Content 结构。' % project)
-    value = value.resolve()
+    value = _plain_directory(value)
     if value.name.casefold() != 'characters' or value.parent.name.casefold() != 'content' \
             or value.parent.parent.name.casefold() != project.casefold():
         raise BridgeError('导出目录的链接目标改变了工程挂载名或 Content/Characters 结构。')
@@ -367,6 +388,29 @@ def export_selection(staging, export_directory):
     stage = Path(staging['source_dir']).resolve()
     if root.is_relative_to(cooked) or cooked.is_relative_to(root) or root.is_relative_to(stage) or stage.is_relative_to(root):
         raise BridgeError('导出目录不能与烘焙快照或打包暂存目录重叠。')
+    folder = package_path(staging['character_folder'], '角色烘焙文件夹')
+    if folder.casefold() in {'/game/characters', '/game/characters/player'}:
+        raise BridgeError('请选择具体角色文件夹，不能清空 Characters 或 Player 总目录。')
+    role = _plain_directory(value / PurePosixPath(folder).name)
+    if role.parent != value or role.name.casefold() == 'player':
+        raise BridgeError('角色导出目录必须直接位于 Characters 内，且不能是 Player 总目录。')
+    content = Path(staging['project_file']).resolve().parent / 'Content'
+    if root.is_relative_to(content) or content.is_relative_to(root):
+        raise BridgeError('导出目录不能与 UE 工程源 Content 目录重叠。')
+    return value, root, role
+
+
+def export_selection(staging, export_directory):
+    """Preflight everything, then rebuild only this character's exported folder."""
+    value, root, role = _export_directories(staging, export_directory)
+    with directory_lock(value, '角色导出目录正在使用，请等待当前导出完成。'):
+        return _export_selection_locked(staging, value, root, role)
+
+
+def _export_selection_locked(staging, value, root, role):
+    project = Path(staging['project_file']).stem
+    stage = Path(staging['source_dir']).resolve()
+    report_progress('检查角色导出目录')
     targets, stale, destination_paths = [], [], set()
     listed = {item['path'].casefold() for item in staging['files']}
     # Complete preflight before overwriting any previous exported file.
@@ -374,6 +418,8 @@ def export_selection(staging, export_directory):
         source = _inside(stage, item['path'])
         exported_relative = exported_relative_path(staging, item['path'])
         destination = _inside(root, exported_relative)
+        if destination != (root / exported_relative).absolute():
+            raise BridgeError('导出资产路径包含重定向链接：' + exported_relative)
         destination_key = str(destination).casefold()
         if destination_key in destination_paths:
             raise BridgeError('不同资产映射到了同一个角色导出文件：' + str(destination))
@@ -400,8 +446,16 @@ def export_selection(staging, export_directory):
                     if not previous.is_file():
                         raise BridgeError('旧旁文件路径被目录占用：' + str(previous))
                     stale.append(previous)
+    # The user explicitly chose a full current-role reset, including files
+    # exported earlier but unchecked now. Never traverse a redirected role.
+    _plain_directory(role)
+    cleared = role.exists()
+    if cleared:
+        report_progress('清理该角色上次的导出文件')
+        shutil.rmtree(role, onerror=_retry_remove)
     exported = []
     for item, source, destination, exported_relative in targets:
+        report_progress('导出所选资产', len(exported), len(targets))
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(destination.name + '.' + uuid.uuid4().hex + '.tmp')
         try:
@@ -410,11 +464,11 @@ def export_selection(staging, export_directory):
         finally:
             temporary.unlink(missing_ok=True)
         exported.append(dict(item, exported_path=str(destination), export_relative_path=exported_relative))
-    # Only obsolete sidecars belonging to the selected package are removed.
-    # Unselected packages stay in xg, and adapter input remains fresh staging.
+    # Shared selected packages outside the role update only their own sidecars.
     for previous in stale:
-        previous.unlink()
+        previous.unlink(missing_ok=True)
     return {'export_directory': str(value.resolve()), 'exported_files': exported,
+            'cleared_character_directory': str(role) if cleared else '',
             'removed_stale_sidecars': [str(path) for path in stale]}
 
 
@@ -564,6 +618,7 @@ def _package_staging(staging, packager_source_dir, packager_tools_dir, output_di
     environment = dict(os.environ)
     environment.update({key: str(temporary_root) for key in ('TEMP', 'TMP', 'TMPDIR')})
     command = ['dotnet', adapter] if adapter.suffix.lower() == '.dll' else [adapter]
+    report_progress('外部打包器：处理贴图与形态键、生成 Mod', log=run_root / 'packager.log')
     _run(command + ['--job', request_path, '--report', reply_path], run_root / 'packager.log', timeout, env=environment)
     reply = json.loads(reply_path.read_text(encoding='utf-8-sig'))
     if reply.get('success') is not True or any(reply.get(key) != request[key]
@@ -577,6 +632,7 @@ def _package_staging(staging, packager_source_dir, packager_tools_dir, output_di
         path = Path(item['path'])
         if not path.is_file() or item['bytes'] <= 0 or path.stat().st_size != item['bytes'] or file_sha256(path) != item['sha256'].lower():
             raise BridgeError('打包输出文件指纹不匹配：' + str(path))
+    report_progress('校验并更新 Mod 成品')
     published = _publish_outputs(outputs, destination, name)
     reply['published_outputs'] = published
     write_json(reply_path, reply)
@@ -611,10 +667,12 @@ def _package_selection_locked(selection_path, packager_source_dir=None, packager
         if report_path == Path(snapshot.get('project_file', '')).resolve() \
                 or (cooked.is_absolute() and report_path.is_relative_to(cooked.resolve())):
             raise BridgeError('打包报告不能覆盖 UE 工程或烘焙快照文件。')
-    result = {'schema_version': 1, 'success': False, 'phase': 'validation', 'errors': [], 'outputs': []}
+    started = time.perf_counter()
+    result = {'schema_version': 1, 'success': False, 'phase': 'validation', 'errors': [], 'outputs': [], 'timings': {}}
     write_json(report_path, result)
     try:
         staging = stage_selection(selection_path)
+        result['timings']['validation_and_staging'] = time.perf_counter() - started
         result.update(job_id=staging['job_id'], cook_id=staging['cook_id'],
                       project_file=staging['project_file'], run_dir=staging['run_dir'],
                       selected_assets=staging['selected_assets'], manifest_sha256=staging['manifest_sha256'],
@@ -624,13 +682,21 @@ def _package_selection_locked(selection_path, packager_source_dir=None, packager
         result['phase'] = 'export'
         if not selection.get('export_directory'):
             raise BridgeError('请选择烘焙资产导出目录（xg/工程名/Content/Characters）。')
+        _, _, role = _export_directories(staging, selection['export_directory'])
+        if _output_directory(staging, output_dir).is_relative_to(role):
+            raise BridgeError('Mod 成品目录不能放在本次将清空的角色导出文件夹内。')
+        phase_started = time.perf_counter()
         result.update(export_selection(staging, selection['export_directory']))
+        result['timings']['export'] = time.perf_counter() - phase_started
         result['phase'] = 'packager'
+        phase_started = time.perf_counter()
         outputs, adapter_report = _package_staging(staging, packager_source_dir, packager_tools_dir,
                                                    output_dir, mod_name, adapter_path, timeout)
         result.update(success=True, phase='complete', outputs=outputs, packager_report=adapter_report)
+        result['timings']['packager_and_publish'] = time.perf_counter() - phase_started
     except Exception as error:
         result['errors'].append(str(error))
+    result['timings']['total'] = time.perf_counter() - started
     write_json(report_path, result)
     return result
 

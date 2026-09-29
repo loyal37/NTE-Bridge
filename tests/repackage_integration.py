@@ -18,7 +18,7 @@ def run(report_path, packager):
     report_path = Path(report_path).resolve()
     assert report_path.is_relative_to(ROOT / 'artifacts')
     report = load_cook_report(report_path, verify_files=True)
-    root = ROOT / 'artifacts/repackage032'
+    root = ROOT / 'artifacts/repackage033'
     root.mkdir(exist_ok=True)
     selection = root / 'selection.json'
     scope = report['character_folder']
@@ -35,11 +35,21 @@ def run(report_path, packager):
         adapter_path=ROOT / 'artifacts/packager_cli/NteBridge.Packager.dll',
         output_dir=root / 'Mods', mod_name='ReplaceTest_P')
     for selected in variants:
+        export = root / 'xg' / Path(report['project_file']).stem / 'Content/Characters'
+        stale = export / scope.rsplit('/', 1)[-1] / 'Obsolete/Old.uasset'
+        other = export / 'AnotherRole/Keep.uasset'
+        for path in (stale, other):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'prior export')
         write_json(selection, dict(schema_version=1, cook_report=str(report_path),
             cook_report_sha256=file_sha256(report_path), selected_assets=selected,
             export_directory=str(root / 'xg' / Path(report['project_file']).stem / 'Content/Characters')))
         result = package_selection(selection, **options)
         assert result['success'], result
+        assert not stale.exists() and other.read_bytes() == b'prior export'
+        role_dir = stale.parent.parent
+        actual_export = {str(path) for path in role_dir.rglob('*') if path.is_file()}
+        assert actual_export == {item['exported_path'] for item in result['exported_files']}
         stages.append(result['run_dir'])
         outputs.append({item['path']: item['sha256'] for item in result['outputs']})
         manifest_dir = root / 'container'
@@ -56,7 +66,8 @@ def run(report_path, packager):
     assert len(list((root / 'packaging').iterdir())) == 1
     assert not any(path.is_dir() for path in (root / 'Mods').iterdir())
     checks += ['same-three-output-paths-replaced', 'retoc-second-inventory-exactly-matches-new-selection',
-               'fixed-stage-clears-old-selected-assets', 'no-leftover-output-transactions']
+               'fixed-stage-clears-old-selected-assets', 'no-leftover-output-transactions',
+               'old-character-export-tree-removed-before-reexport', 'other-role-export-preserved']
     with patch('nte_bridge.packaging._run', side_effect=BridgeError('intentional adapter failure')):
         failed = package_selection(selection, **options)
     assert not failed['success'] and failed['phase'] == 'packager'

@@ -1,8 +1,10 @@
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -143,23 +145,116 @@ class CookingTests(unittest.TestCase):
         self.save_selection()
         self.assertEqual(len(stage_selection(self.selection_path)['files']), 2)
 
-    def test_export_preserves_game_paths_keeps_unselected_and_removes_only_selected_stale_sidecars(self):
+    def test_export_rebuilds_role_but_preserves_other_roles_and_shared_unselected(self):
         stage = stage_selection(self.selection_path)
         existing = self.export / 'A/Old_Unselected.uasset'
         existing.parent.mkdir(parents=True)
         existing.write_bytes(b'keep old unselected')
+        other = self.export / 'Other/T_Keep.uasset'
+        shared = self.export.parent / 'Common/T_Keep.uasset'
+        for path in (other, shared):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'untouched')
         stale = self.export.parent / 'Common/MI_Custom.ubulk'
-        stale.parent.mkdir(parents=True)
+        stale.parent.mkdir(parents=True, exist_ok=True)
         stale.write_bytes(b'old now absent sidecar')
         result = export_selection(stage, self.export)
         self.assertEqual(len(result['exported_files']), 4)
-        self.assertEqual(existing.read_bytes(), b'keep old unselected')
+        self.assertFalse(existing.exists())
+        self.assertEqual(result['cleared_character_directory'], str(self.export / 'A'))
+        for path in (other, shared):
+            self.assertEqual(path.read_bytes(), b'untouched')
         self.assertFalse(stale.exists())
         self.assertTrue((self.export / 'A/SK_Body.uasset').is_file())
         self.assertTrue((self.export.parent / 'Common/MI_Custom.uasset').is_file())
         self.assertFalse(any('Old_Unselected' in item['path'] for item in stage['files']))
         for row in result['exported_files']:
             self.assertEqual(file_sha256(row['exported_path']), row['sha256'])
+
+    def test_unselected_cooked_changes_do_not_trigger_reads_or_enter_staging(self):
+        (self.cooked / 'HT/Content/Characters/A/T_Preview.uexp').write_bytes(b'unrelated change')
+        hashed = []
+        original = file_sha256
+        def tracked(path):
+            hashed.append(Path(path))
+            return original(path)
+        with patch('nte_bridge.cooking._inventory', side_effect=AssertionError('No full-tree scan')), \
+                patch('nte_bridge.packaging.file_sha256', side_effect=tracked):
+            result = stage_selection(self.selection_path)
+        self.assertEqual(len(result['files']), 4)
+        self.assertTrue(all('T_Preview' not in str(path) for path in hashed))
+        self.assertTrue(all(not path.is_relative_to(self.cooked) for path in hashed))
+        with self.assertRaisesRegex(BridgeError, '增加、删除或修改'):
+            load_cook_report(self.report_path, verify_files=True)
+
+    def test_hash_inventory_reuses_only_unchanged_files_and_refreshes_added_removed(self):
+        from nte_bridge.cooking import _inventory
+        cache = self.root / 'hashes.json'
+        first = _inventory(self.cooked, cache)
+        with patch('nte_bridge.cooking.file_sha256', side_effect=AssertionError('Unchanged file rehashed')):
+            self.assertEqual(_inventory(self.cooked, cache), first)
+        changed = self.cooked / 'HT/Content/Characters/A/SK_Body.uexp'
+        changed.write_bytes(b'new payload')
+        removed = changed.with_suffix('.uasset')
+        removed.unlink()
+        added = changed.with_suffix('.ubulk')
+        added.write_bytes(b'new bulk')
+        with patch('nte_bridge.cooking.file_sha256', wraps=file_sha256) as hashes:
+            actual = _inventory(self.cooked, cache)
+        self.assertEqual({call.args[0] for call in hashes.call_args_list}, {changed, added})
+        self.assertEqual(actual, _inventory(self.cooked))
+        self.assertNotIn(removed.relative_to(self.cooked).as_posix(), json.loads(cache.read_text())['files'])
+
+    def test_selected_file_hash_and_presence_fail_before_old_export_is_deleted(self):
+        old = self.export / 'A/Old.uasset'
+        old.parent.mkdir(parents=True)
+        old.write_bytes(b'old export')
+        stage = stage_selection(self.selection_path)
+        selected = Path(stage['source_dir']) / stage['files'][0]['path']
+        selected.write_bytes(b'changed')
+        with self.assertRaisesRegex(BridgeError, '暂存文件发生改变'):
+            export_selection(stage, self.export)
+        self.assertEqual(old.read_bytes(), b'old export')
+        cooked = self.cooked / 'HT/Content/Characters/A/SK_Body.uexp'
+        cooked.unlink()
+        with self.assertRaisesRegex(BridgeError, '增加、删除或修改'):
+            stage_selection(self.selection_path)
+
+    def test_export_rejects_source_content_and_broad_role_before_deletion(self):
+        stage = stage_selection(self.selection_path)
+        # Match the mount name so this specifically exercises source protection.
+        source_project = self.root / 'SourceProjects/HT/HT.uproject'
+        source_project.parent.mkdir(parents=True)
+        source_project.write_text('{}')
+        source_export = source_project.parent / 'Content/Characters'
+        old = source_export / 'A/Source.uasset'
+        old.parent.mkdir(parents=True)
+        old.write_bytes(b'source')
+        with self.assertRaisesRegex(BridgeError, '源 Content'):
+            export_selection(dict(stage, project_file=str(source_project)), source_export)
+        self.assertEqual(old.read_bytes(), b'source')
+        for scope in ('/Game/Characters', '/Game/Characters/Player'):
+            with self.assertRaisesRegex(BridgeError, '具体角色'):
+                export_selection(dict(stage, character_folder=scope), self.export)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows junction boundary')
+    def test_redirected_role_never_deletes_another_character(self):
+        stage = stage_selection(self.selection_path)
+        other = self.export / 'Other'
+        other.mkdir(parents=True)
+        (other / 'Keep.uasset').write_bytes(b'other role')
+        link = self.export / 'A'
+        subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command',
+            'New-Item -ItemType Junction -Path $env:NTE_TEST_LINK -Target $env:NTE_TEST_TARGET | Out-Null'],
+            env=dict(os.environ, NTE_TEST_LINK=str(link), NTE_TEST_TARGET=str(other)),
+            capture_output=True, check=True, timeout=20)
+        try:
+            with self.assertRaises(BridgeError):
+                export_selection(stage, self.export)
+            self.assertEqual((other / 'Keep.uasset').read_bytes(), b'other role')
+        finally:
+            self.assertEqual(link.resolve(), other.resolve())
+            link.rmdir()
 
     def test_export_preflights_all_targets_before_overwriting(self):
         stage = stage_selection(self.selection_path)

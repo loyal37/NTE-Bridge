@@ -234,6 +234,8 @@ def run_commandlet_job(manifest_path, engine_dir=DEFAULT_ENGINE, timeout=300):
     invocation_id = (json.loads(report_file.read_text(encoding='utf-8')).get('invocation_id')
                      if report_file.is_file() else None)
     log_path = source.with_name("ue_commandlet.log")
+    from .progress import report_progress
+    report_progress('启动 UE 后台并加载工程', log=log_path)
     with log_path.open("w", encoding="utf-8") as log:
         try:
             # UE FParse needs -script="a path" rather than "-script=a path".
