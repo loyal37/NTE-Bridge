@@ -11,7 +11,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "blender_addon"))
 from nte_bridge.core import BridgeError, write_json
-from nte_bridge.packaging import _inside, _unreal_command_line, cook_assets, file_sha256, package_job, stage_assets
+from nte_bridge.packaging import _inside, _run, _unreal_command_line, cook_assets, file_sha256, package_job, stage_assets
 
 
 class PackagingTests(unittest.TestCase):
@@ -83,6 +83,25 @@ class PackagingTests(unittest.TestCase):
         (self.cooked / "HT/Content/Characters/SK_Test.uasset").unlink()
         with self.assertRaisesRegex(BridgeError, "Required cooked"):
             self.stage()
+
+    def test_preview_texture_dependencies_are_excluded_from_staging(self):
+        source = self.job / 'textures/preview.png'
+        source.write_bytes(b'preview-only')
+        preview_path = '/Game/NTEBridgePreview/T_Diffuse'
+        self.manifest['textures'].append(dict(id='preview', source_file='textures/preview.png',
+                                             asset_path=preview_path, role='BASE_COLOR', origin='preview'))
+        self.manifest['material_previews'] = [dict(material_path='/Game/Shared/M_Test', texture_path=preview_path)]
+        self.save()
+        self.report['source_sha256']['textures/preview.png'] = file_sha256(source)
+        self.report['assets'].append(dict(asset_path=preview_path, asset_type='Texture2D', origin='preview', saved=True))
+        write_json(self.ue_report, self.report)
+        for extension in ('.uasset', '.uexp', '.ubulk', '.uptnl'):
+            path = self.cooked / ('HT/Content/NTEBridgePreview/T_Diffuse' + extension)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'cooked-preview-dependency')
+        staged = self.stage()
+        self.assertEqual(len(staged['files']), 8)
+        self.assertFalse(any('NTEBridgePreview' in entry['path'] for entry in staged['files']))
 
     def test_zero_length_required_asset(self):
         (self.cooked / "HT/Content/Shared/T_Test.uasset").write_bytes(b"")
@@ -203,7 +222,7 @@ class PackagingTests(unittest.TestCase):
         adapter = self.root / "adapter.dll"
         adapter.write_bytes(b"mock adapter; never executed")
         for scenario in ("valid", "stale", "tampered"):
-            def fake_runner(command, log_path, timeout):
+            def fake_runner(command, log_path, timeout, *, env=None):
                 request = json.loads(Path(command[command.index("--job") + 1]).read_text())
                 reply_path = Path(command[command.index("--report") + 1])
                 output_dir = Path(request["output_dir"])
@@ -229,6 +248,49 @@ class PackagingTests(unittest.TestCase):
                 self.assertEqual(len(report["outputs"]), 3)
             else:
                 self.assertEqual(report["outputs"], [])
+
+    def test_packager_child_temporary_files_stay_in_job_cache(self):
+        adapter = self.root / "adapter.dll"
+        adapter.write_bytes(b"mock adapter; child below exercises temporary-file routing")
+        # Stand in for the adapter while retaining the actual subprocess runner
+        # and its output verification. The child uses its normal temp lookup.
+        script = """
+import hashlib, json, os, pathlib, sys, tempfile
+request = json.loads(pathlib.Path(sys.argv[2]).read_text())
+temporary = pathlib.Path(tempfile.mkdtemp(prefix='external-packager-'))
+(temporary / 'staging-copy.uasset').write_bytes(b'child temporary asset')
+print(json.dumps({'temporary': str(temporary), 'environment': {
+    key: os.environ[key] for key in ('TEMP', 'TMP', 'TMPDIR')}}), flush=True)
+destination = pathlib.Path(request['output_dir'])
+destination.mkdir(parents=True)
+outputs = []
+for extension in ('.pak', '.utoc', '.ucas'):
+    output = destination / (request['mod_name'] + extension)
+    output.write_bytes(('fixture ' + extension).encode())
+    outputs.append({'path': str(output), 'bytes': output.stat().st_size,
+                    'sha256': hashlib.sha256(output.read_bytes()).hexdigest()})
+reply = {key: request[key] for key in ('job_id', 'manifest_sha256', 'run_id')}
+reply.update(success=True, outputs=outputs)
+pathlib.Path(sys.argv[4]).write_text(json.dumps(reply))
+"""
+
+        def adapter_child(command, log_path, timeout, *, env=None):
+            self.assertIsNotNone(env)
+            _run([sys.executable, "-c", script] + command[command.index("--job"):],
+                 log_path, timeout, env=env)
+
+        original_environment = dict(os.environ)
+        with mock.patch("nte_bridge.packaging._run", side_effect=adapter_child):
+            report = package_job(self.manifest_path, self.ue_report, packager_tools_dir=self.root,
+                                 run_cook=False, cooked_root=self.cooked, adapter_path=adapter)
+        self.assertEqual(dict(os.environ), original_environment)
+        self.assertTrue(report["success"], report["errors"])
+        run_root = Path(report["run_dir"])
+        self.assertTrue(run_root.is_relative_to(self.job))
+        child = json.loads((run_root / "packager.log").read_text())
+        self.assertTrue(Path(child["temporary"]).is_relative_to(run_root / "temp"))
+        self.assertTrue((Path(child["temporary"]) / "staging-copy.uasset").is_file())
+        self.assertEqual(set(child["environment"].values()), {str(run_root / "temp")})
 
     def test_adapter_rejects_unlisted_files_without_executing_tools(self):
         adapter = REPO / "artifacts/packager_cli/NteBridge.Packager.dll"

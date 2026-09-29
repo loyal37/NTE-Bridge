@@ -99,6 +99,44 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(texture_settings("LIGHT_MAP"), {"compression": "BC7", "srgb": False})
         self.assertEqual(texture_settings("NORMAL"), {"compression": "NORMALMAP", "srgb": False})
 
+    def test_preview_texture_imported_but_never_exported(self):
+        manifest = fixture()
+        texture = {"id": "preview", "source_file": "textures/preview.png",
+                   "asset_path": "/Game/NTEBridgePreview/T_Diffuse", "role": "BASE_COLOR", "origin": "preview"}
+        manifest["textures"] = [texture]
+        manifest["material_previews"] = [{"material_path": "/Game/Shared/M_Same",
+                                           "texture_path": texture["asset_path"]}]
+        self.assertIs(validate_manifest(manifest), manifest)
+        manifest["export_assets"].append({"asset_path": texture["asset_path"], "asset_type": "Texture2D", "origin": "mod"})
+        with self.assertRaisesRegex(BridgeError, "预览贴图不打包"):
+            validate_manifest(manifest)
+        texture["origin"] = "mod"
+        self.assertIs(validate_manifest(manifest), manifest)
+        del texture["origin"]  # Older explicit texture manifests remain compatible.
+        self.assertIs(validate_manifest(manifest), manifest)
+
+    def test_preview_bindings_require_declared_diffuse_and_unique_referenced_material(self):
+        base = fixture()
+        base["textures"] = [{"id": "preview", "source_file": "textures/p.png",
+                             "asset_path": "/Game/Preview/T_P", "role": "BASE_COLOR", "origin": "preview"}]
+        binding = {"material_path": "/Game/Shared/M_Same", "texture_path": "/Game/Preview/T_P"}
+        base["material_previews"] = [binding]
+        for field, value in (("material_path", "/Game/Unrelated/M_Other"),
+                             ("texture_path", "/Game/Preview/Missing")):
+            manifest = copy.deepcopy(base)
+            manifest["material_previews"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(BridgeError):
+                validate_manifest(manifest)
+        manifest = copy.deepcopy(base)
+        manifest["material_previews"].append(dict(binding))
+        with self.assertRaisesRegex(BridgeError, "重复"):
+            validate_manifest(manifest)
+        for field, value in (("origin", "unknown"), ("role", "NORMAL")):
+            manifest = copy.deepcopy(base)
+            manifest["textures"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(BridgeError):
+                validate_manifest(manifest)
+
     def test_round_trip_checks_real_source(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

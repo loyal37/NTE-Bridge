@@ -4,10 +4,65 @@ import os
 from pathlib import Path
 
 
-def default_job_root():
-    """An absolute cache location also works before the first .blend save."""
+def _absolute_path(value):
+    value = str(value or '').strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        value = value[1:-1].strip()
+    if not value:
+        return None
+    try:
+        path = Path(value)
+        return path.resolve() if path.is_absolute() else None
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _non_c_path(value):
+    path = _absolute_path(value)
+    if path is None or path.drive.upper().removeprefix('\\\\?\\') == 'C:':
+        return None
+    return path
+
+
+def default_cache_root(project_file='', blend_file='', source_folder=''):
+    """Suggest a context-owned cache without creating folders or choosing C:."""
+    for value, suffix, relative in (
+            (project_file, '.uproject', 'Saved/NTEBridgeCache'),
+            (blend_file, '.blend', 'NTEBridgeCache'),
+            (source_folder, '', 'NTEBridgeCache')):
+        path = _non_c_path(value)
+        if path is None:
+            continue
+        try:
+            if suffix:
+                if path.suffix.lower() != suffix or not path.is_file():
+                    continue
+            elif not path.is_dir():
+                continue
+            candidate = _non_c_path(path.parent / relative)
+            if candidate is not None and not candidate.is_file() and not candidate.parent.is_file():
+                return str(candidate)
+        except (OSError, ValueError):
+            continue
+    return ''
+
+
+def default_job_root(project_file='', blend_file='', source_folder=''):
+    """Compatibility wrapper; an unset context requires an explicit cache choice."""
+    cache = default_cache_root(project_file, blend_file, source_folder)
+    return str(Path(cache) / 'Jobs') if cache else ''
+
+
+def legacy_default_job_root(value):
+    """Identify old automatic locations for migration, never select them anew."""
+    if str(value or '').strip().strip('"\'') == '//NTEBridgeJobs':
+        return True
+    path = _absolute_path(value)
+    if path is None:
+        return False
     base = os.environ.get('LOCALAPPDATA')
-    return str((Path(base) if base else Path.home() / '.cache') / 'NTEBridge' / 'Jobs')
+    old_root = (Path(base) if base else Path.home() / '.cache') / 'NTEBridge/Jobs'
+    return path == _absolute_path(old_root)
 
 
 def _registered_engines(association):

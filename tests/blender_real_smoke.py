@@ -82,7 +82,7 @@ def main():
     settings.mesh_path = args.asset_root
     settings.skeleton_path = args.asset_root + '_Skeleton'
     settings.create_placeholders = True
-    settings.job_root = str(output / 'jobs')
+    settings.cache_root = str(output)
     bpy.ops.nte_bridge.refresh_slots()
     for part in settings.parts:
         material_name = re.sub('[^A-Za-z0-9_]', '_', part.source_material.name if part.source_material else 'Empty')

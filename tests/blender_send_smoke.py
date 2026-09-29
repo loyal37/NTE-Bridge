@@ -57,7 +57,7 @@ def main():
     assert (settings.mesh_path, settings.skeleton_path, settings.physics_path) == (mesh_path, skeleton_path, physics_path)
     for texture in settings.textures:
         texture.asset_path = asset_root + '/Textures/T_' + texture.role
-    settings.job_root = str(output / 'jobs')
+    settings.cache_root = str(output)
     settings.engine_dir = ''  # Resolve this exact .uproject association.
     settings.sync_mode = 'commandlet'
     settings.last_manifest = str(output / 'old-job-must-not-be-used.json')
@@ -94,7 +94,7 @@ def main():
     assert terminal == {'FINISHED'}, settings.status
     assert not settings.busy and phases == ['export', 'sync']
     manifest_path = Path(settings.last_manifest)
-    assert manifest_path.is_relative_to(output / 'jobs')
+    assert manifest_path.is_relative_to(output / 'Jobs')
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     report = json.loads(Path(settings.last_report).read_text(encoding='utf-8'))
     assert report['success'] and report['job_id'] == manifest['job_id']

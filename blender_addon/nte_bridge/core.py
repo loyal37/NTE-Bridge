@@ -7,7 +7,7 @@ import re
 import tempfile
 
 SCHEMA_VERSION = 1
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 HIDDEN_STATE = "$hidden"
 
 
@@ -201,14 +201,32 @@ def validate_manifest(data, job_dir=None):
     _require(skeleton.casefold() not in {p.casefold() for p in material_paths}, "骨架路径与材质路径冲突")
     _require(not physics or physics.casefold() not in {p.casefold() for p in material_paths}, "物理路径与材质路径冲突")
     sources, asset_ids = [source], [mesh_id]
+    export_targets = dict(asset_targets)
+    texture_targets = {}
     for tex in _records(data.get("textures", []), "textures"):
         asset_ids.append(_text(tex.get("id"), "贴图 ID"))
         path = package_path(tex.get("asset_path"), "贴图路径")
         _require(path.casefold() not in asset_targets and path.casefold() not in reference_targets,
                  f"重复或冲突的资源路径: {path}")
         asset_targets[path.casefold()] = (path, "Texture2D")
+        origin = tex.get("origin", "mod")
+        _require(origin in ("mod", "preview"), f"贴图来源无效: {path}")
+        if origin == "mod":
+            export_targets[path.casefold()] = (path, "Texture2D")
+        texture_targets[path.casefold()] = tex
         texture_settings(tex.get("role"))
         sources.append(_text(tex.get("source_file"), "贴图文件"))
+    preview_materials = []
+    for preview in _records(data.get("material_previews", []), "material_previews"):
+        material = package_path(preview.get("material_path"), "预览材质路径")
+        texture = package_path(preview.get("texture_path"), "预览漫射贴图路径")
+        _require(material.casefold() in {p.casefold() for p in material_paths},
+                 f"预览材质未被本次网格引用: {material}")
+        _require(texture.casefold() in texture_targets, f"预览贴图未在任务中声明: {texture}")
+        _require(texture_targets[texture.casefold()]["role"] == "BASE_COLOR",
+                 f"材质漫射预览需要 BASE_COLOR 贴图: {texture}")
+        preview_materials.append(material.casefold())
+    _unique(preview_materials, "预览材质")
     _unique(asset_ids, "资源 ID")
     for relative in sources:
         resolved = resolve_source(job_dir or Path.cwd(), relative)
@@ -221,11 +239,11 @@ def validate_manifest(data, job_dir=None):
         path = package_path(asset.get("asset_path"), "打包资源路径")
         export_paths.append(path.casefold())
         _require(asset.get("origin") == "mod", f"禁止打包原游戏占位资源: {path}")
-        _require(path.casefold() in asset_targets, f"资源未在本任务声明为网格或替换贴图: {path}")
-        _require(asset.get("asset_type") == asset_targets[path.casefold()][1],
+        _require(path.casefold() in export_targets, f"资源未在本任务声明为网格或替换贴图（预览贴图不打包）: {path}")
+        _require(asset.get("asset_type") == export_targets[path.casefold()][1],
                  f"打包资源类型错误: {path}")
     _unique(export_paths, "打包资源路径")
-    _require(set(export_paths) == set(asset_targets), "打包清单必须包含本次网格和全部明确替换贴图")
+    _require(set(export_paths) == set(export_targets), "打包清单必须包含本次网格和全部明确替换贴图")
     return data
 
 

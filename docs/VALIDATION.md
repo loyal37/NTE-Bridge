@@ -1,4 +1,19 @@
-# v0.2.1 验证记录
+# v0.2.2 验证记录
+
+日期：2026-09-29。Blender 固定 4.5.7 LTS；实际导入使用隔离的 UE 5.6.1 工程。
+
+- 66 项纯 Python 测试通过。缓存选择覆盖工程/Blend/角色目录优先级、C 盘排除、无上下文时不回退 AppData、带引号路径及只读识别。预览绑定与打包清单校验覆盖来源、角色和重复冲突；预览依赖即使出现在 cooked 目录也不会进入暂存清单。打包测试启动真实子进程，确认默认临时文件落在任务缓存，父进程环境不变；未重复完整外部打包。
+- 10 项 Blender 缓存集成检查通过：自选中文/空格/引号目录实际导出 FBX、任务与报告共用缓存、切换目录清除历史选择、保存重载、已保存相对路径、未保存相对路径拒绝、旧 C 盘配置实际 load_post 迁移、缓存外任务在同步/打包启动前拒绝。旧 C 盘缓存文件清单与源文件保持不变。
+- 11 项实际导出→UE 后台发送检查通过；FBX、清单、同步报告与日志均在选定缓存的 `Jobs/<任务 ID>`。测试仍确认独立槽、形态键、四种贴图以及原路径资产创建和占位排除。
+- 在独立 Blender 窗口绘制并检查高级设置截图，缓存选择器、派生路径和中文说明正常，用户正在使用的窗口未被操作。
+- Blender 漫射预览 17 项检查通过：只读当前生效输出，支持直接图像、转接点与 Diffuse BSDF；文件图、打包图及编辑/生成图正确落在缓存，编辑和生成 PNG 回读像素正确。相同来源复用、同图不同原始路径保留、目标冲突/路径不明拒绝、手动路径补充及替换图复用、DiffuseColorMap 参数别名、预览排除打包及源图像/文件不变均验证。
+- 安装 ZIP 使用 Blender 实际的 addon_utils.enable 入口验证注册；缓存迁移在插件启用的受限数据上下文结束后执行，并在打开工程时执行。
+- UE 材质预览 11 项检查通过，两次编辑器启动与五次导入验证：可见槽名等于材质名、共用材质仍有独立导入标识、原路径预览贴图 BC7+sRGB、旧空材质修复、连接与元数据保存重载、重复导入无重复节点、改图更新，以及用户材质图/实例/改接后的受管图保留。
+- 真实 Nitsa 从原 `.blend` 只读导出，再在四项依赖均被明确禁用的隔离 UE 工程导入，并重启 UE 回读：11 个可见材质名与独立导入标识、592 根骨骼、83 个形态键、4 层 UV；7 张漫射按 JSON 的游戏原路径保存，10 个材质基础颜色连接正确，全部 BC7+sRGB。独立逐槽审计确认源图片与暂存字节一致。自动图片均为预览，打包清单仅 1 个网格。源 `.blend`、图片、原任务及工程文件保持不变。
+
+本地证据：`artifacts/unit-v0.2.2.log`、`artifacts/cache_smoke/latest_result.json`、`artifacts/blender_send_smoke/result.json`、`artifacts/ui_022/sidebar.png`、`artifacts/preview_smoke/latest_result.json`、`artifacts/preview_smoke/run-emx4tw2u/result.json`、`artifacts/preview_nitsa/mapping_audit.json`、`artifacts/dependency_smoke/run-hjrtj2pz/preview_readback.json`。本次仅推送 main，不发布 Release。
+
+## v0.2.1 验证记录
 
 日期：2026-09-29。Blender 使用指定的 4.5.7 LTS，UE 为 5.6.1。
 

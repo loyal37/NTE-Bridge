@@ -6,12 +6,14 @@ import re
 import subprocess
 
 import bpy
+from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, PointerProperty, StringProperty
 
 from .blender_export import finish_job, graph_dict, new_id, prepare_job, profile_manifest
 from .core import BridgeError
 from .discovery import scan_character
-from .workflow import default_job_root, detect_engine_dir, detect_packager_source
+from .workflow import detect_engine_dir, detect_packager_source
+from .blender_cache import _directory, ensure_cache, selected_manifest
 
 _ENUM_CACHE = {}
 
@@ -431,6 +433,36 @@ def _mesh_changed(settings, context):
             settings.status = str(error)
 
 
+def _cache_changed(settings, context):
+    settings.last_manifest = ''
+    settings.last_report = ''
+    settings.job_root = ''
+    if settings.cache_root.strip():
+        try:
+            settings.job_root = str(_directory(settings.cache_root) / 'Jobs')
+        except BridgeError:
+            pass
+
+
+@persistent
+def _restore_cache(_unused=None):
+    for scene in bpy.data.scenes:
+        settings = scene.nte_bridge
+        try:
+            ensure_cache(settings)
+        except (BridgeError, OSError):
+            settings.job_root = ''
+            settings.last_manifest = ''
+            settings.last_report = ''
+
+
+def _initialize_cache():
+    # Blender restricts bpy.data while enabling an addon. Migrate loaded scenes
+    # after registration has left that context; load_post covers opened files.
+    _restore_cache()
+    return None
+
+
 class NTEBridgeSettings(bpy.types.PropertyGroup):
     character_id: StringProperty()
     mesh_id: StringProperty()
@@ -457,7 +489,10 @@ class NTEBridgeSettings(bpy.types.PropertyGroup):
     active_part: IntProperty(min=0)
     textures: CollectionProperty(type=NTEBridgeTextureEntry)
     active_texture: IntProperty(min=0)
-    job_root: StringProperty(name="桥接任务目录", subtype='DIR_PATH', default='//NTEBridgeJobs')
+    cache_root: StringProperty(name="缓存目录", subtype='DIR_PATH', update=_cache_changed,
+        options={'PATH_SUPPORTS_BLEND_RELATIVE'},
+        description="统一存放桥接任务、FBX、临时文件与报告；更改后需重新导出，随 Blender 工程保存")
+    job_root: StringProperty(name="桥接任务目录", subtype='DIR_PATH', options={'HIDDEN'})
     engine_dir: StringProperty(name="UE 安装目录", subtype='DIR_PATH')
     sync_mode: EnumProperty(name="同步方式", default='commandlet',
         description="后台导入要求目标工程关闭；自动启动 UE 命令行编辑器，完成后退出",
@@ -714,8 +749,7 @@ def _engine_path(settings):
 
 
 def _job_defaults(settings):
-    if not settings.job_root.strip() or (settings.job_root == '//NTEBridgeJobs' and not bpy.data.filepath):
-        settings.job_root = default_job_root()
+    ensure_cache(settings)
 
 
 def _task_command(manifest, engine, python, action, report, mode='remote'):
@@ -857,9 +891,7 @@ class NTEBRIDGE_OT_worker(_WorkerModal, bpy.types.Operator):
     def execute(self, context):
         settings = context.scene.nte_bridge
         try:
-            manifest = Path(bpy.path.abspath(settings.last_manifest)).resolve()
-            if not settings.last_manifest or not manifest.is_file():
-                raise BridgeError('请先发送到 UE，或在高级设置选择已导出的桥接任务。')
+            manifest = selected_manifest(settings)
             engine, python = _engine_path(settings)
             self._report = manifest.parent / (self.action + '_report.json')
             command = _task_command(manifest, engine, python, self.action, self._report, settings.sync_mode)
@@ -1043,6 +1075,8 @@ class NTEBRIDGE_PT_textures(_NTEChildPanel, bpy.types.Panel):
     def draw(self, context):
         settings = context.scene.nte_bridge
         column = _panel_column(self, context)
+        column.label(text='已连接的漫射自动用于 UE 预览')
+        column.label(text='这里只添加需要打包的替换贴图')
         if settings.textures:
             column.template_list('NTEBRIDGE_UL_textures', '', settings, 'textures', settings, 'active_texture',
                                  rows=min(4, max(2, len(settings.textures))))
@@ -1111,6 +1145,13 @@ class NTEBRIDGE_PT_advanced(_NTEChildPanel, bpy.types.Panel):
     def draw(self, context):
         settings = context.scene.nte_bridge
         column = _panel_column(self, context)
+        _wide_prop(column, settings, 'cache_root')
+        column.label(text='任务、报告和临时文件统一存放')
+        column.label(text='留空时自动选择非 C 盘位置')
+        paths = column.column()
+        paths.enabled = False
+        _wide_prop(paths, settings, 'job_root')
+        column.separator()
         column.label(text='资源路径（从角色资料自动读取）')
         for prop in ('mesh_path', 'skeleton_path', 'physics_path'):
             _wide_prop(column, settings, prop)
@@ -1119,13 +1160,18 @@ class NTEBRIDGE_PT_advanced(_NTEChildPanel, bpy.types.Panel):
         column.label(text='工具路径（留空时自动查找）')
         for prop in ('engine_dir', 'packager_source'):
             _wide_prop(column, settings, prop)
-        _wide_prop(column, settings, 'job_root')
         column.separator()
         column.label(text='独立步骤与诊断')
         column.operator('nte_bridge.export', text='仅导出当前配置', icon='EXPORT')
-        _wide_prop(column, settings, 'last_manifest')
-        column.operator('nte_bridge.worker', text='发送已有任务到 UE', icon='IMPORT').action = 'sync'
-        _wide_prop(column, settings, 'last_report')
+        paths = column.column()
+        paths.enabled = False
+        _wide_prop(paths, settings, 'last_manifest')
+        row = column.row()
+        row.enabled = bool(settings.last_manifest)
+        row.operator('nte_bridge.worker', text='发送最近任务到 UE', icon='IMPORT').action = 'sync'
+        paths = column.column()
+        paths.enabled = False
+        _wide_prop(paths, settings, 'last_report')
 
 
 def _add_menu(self, context):
@@ -1155,9 +1201,18 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Scene.nte_bridge = PointerProperty(type=NTEBridgeSettings)
     bpy.types.NODE_MT_add.append(_add_menu)
+    bpy.app.handlers.load_post.append(_restore_cache)
+    if hasattr(bpy.data, 'scenes'):
+        _restore_cache()
+    else:
+        bpy.app.timers.register(_initialize_cache, first_interval=0.0)
 
 
 def unregister():
+    if bpy.app.timers.is_registered(_initialize_cache):
+        bpy.app.timers.unregister(_initialize_cache)
+    if _restore_cache in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_restore_cache)
     bpy.types.NODE_MT_add.remove(_add_menu)
     if hasattr(bpy.types.Scene, 'nte_bridge'):
         del bpy.types.Scene.nte_bridge

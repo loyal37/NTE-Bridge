@@ -116,7 +116,7 @@ def main():
     settings.mesh_path = '/Game/NTEBridgeTest/SM_Bridge'
     settings.skeleton_path = '/Game/NTEBridgeTest/SK_Bridge'
     settings.create_placeholders = True
-    settings.job_root = str(output / 'jobs')
+    settings.cache_root = str(output)
     require(bpy.ops.nte_bridge.refresh_slots() == {'FINISHED'}, 'slot initialization failed')
     for part in settings.parts:
         part.material_path = '/Game/NTEBridgeTest/M_Shared'

@@ -19,3 +19,4 @@ bin/
 obj/
 .vs/
 local-settings.json
+NTEBridgeCache/

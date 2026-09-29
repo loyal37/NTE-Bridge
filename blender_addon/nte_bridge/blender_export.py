@@ -11,6 +11,8 @@ import bpy
 from mathutils import Matrix
 
 from .core import BridgeError, compile_graph, validate_manifest, write_json
+from .blender_cache import ensure_cache
+from .blender_textures import discover_material_previews, stage_preview_images
 
 
 def new_id():
@@ -47,7 +49,7 @@ def graph_dict(tree):
     return {"id": tree.graph_id, "nodes": nodes, "links": links}
 
 
-def profile_manifest(settings, job_id=None):
+def profile_manifest(settings, job_id=None, preview_staging=None):
     # Also guard direct/scripted exports, not only operators in the sidebar.
     from .blender_ui import _ensure_source_current
     _ensure_source_current(settings)
@@ -89,7 +91,11 @@ def profile_manifest(settings, job_id=None):
             raise BridgeError("贴图文件不存在: " + entry.file_path)
         textures.append({"id": entry.texture_id,
                          "source_file": "textures/" + uuid.UUID(entry.texture_id).hex + path.suffix.lower(),
-                         "asset_path": entry.asset_path.strip(), "role": entry.role})
+                         "asset_path": entry.asset_path.strip(), "role": entry.role, "origin": "mod"})
+    previews, material_previews, staging = discover_material_previews(settings, textures)
+    textures.extend(previews)
+    if preview_staging is not None:
+        preview_staging.extend(staging)
     manifest = {"schema_version": 1, "job_id": job_id or new_id(), "graph_id": graph['id'],
                 "character_id": settings.character_id,
                 "project_file": str(Path(bpy.path.abspath(settings.project_file)).resolve()) if settings.project_file else "",
@@ -98,11 +104,11 @@ def profile_manifest(settings, job_id=None):
                          "asset_path": settings.mesh_path.strip(),
                          "skeleton_path": settings.skeleton_path.strip(),
                          "physics_asset_path": settings.physics_path.strip(), "expected": expected},
-                "parts": parts, "textures": textures, "features": features,
+                "parts": parts, "textures": textures, "material_previews": material_previews, "features": features,
                 "export_assets": [{"asset_path": settings.mesh_path.strip(),
                                    "asset_type": "SkeletalMesh", "origin": "mod"}] + [
                     {"asset_path": t['asset_path'], "asset_type": "Texture2D", "origin": "mod"}
-                    for t in textures]}
+                    for t in textures if t.get('origin', 'mod') == 'mod']}
     validate_manifest(manifest)
     return manifest
 
@@ -178,10 +184,9 @@ def _write_export_copy(settings, blend_path):
 
 def prepare_job(context, settings=None):
     settings = settings or context.scene.nte_bridge
-    manifest = profile_manifest(settings)
-    if not settings.job_root.strip():
-        raise BridgeError("请选择任务输出目录。")
-    job_dir = Path(bpy.path.abspath(settings.job_root)).resolve() / manifest['job_id']
+    preview_staging = []
+    manifest = profile_manifest(settings, preview_staging=preview_staging)
+    job_dir = ensure_cache(settings) / manifest['job_id']
     job_dir.mkdir(parents=True, exist_ok=False)
     (job_dir / 'meshes').mkdir()
     blend_path = job_dir / '_export_copy.blend'
@@ -190,6 +195,7 @@ def prepare_job(context, settings=None):
         (job_dir / 'textures').mkdir()
     for entry, texture in zip(settings.textures, manifest['textures']):
         shutil.copyfile(bpy.path.abspath(entry.file_path), job_dir / texture['source_file'])
+    stage_preview_images(preview_staging, job_dir)
     write_json(job_dir / 'graph.json', graph_dict(settings.graph))
     write_json(job_dir / 'manifest.pending.json', manifest)
     return {"job_dir": job_dir, "manifest": manifest, "blend_path": blend_path,

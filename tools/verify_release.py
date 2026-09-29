@@ -38,18 +38,20 @@ def main():
     runner = work / "verify_addon.py"
     report_path = work / "result.json"
     runner.write_text(
-        "import sys, json\nfrom pathlib import Path\nimport bpy\n"
+        "import sys, json\nfrom pathlib import Path\nimport bpy, addon_utils\n"
         + "sys.path.insert(0, " + repr(str(work)) + ")\n"
         + "import nte_bridge\nfrom nte_bridge import core\n"
         + "assert Path(nte_bridge.__file__).resolve().is_relative_to(Path(" + repr(str(work)) + "))\n"
-        + "nte_bridge.register()\n"
+        + "addon_utils.enable('nte_bridge', default_set=False)\n"
+        + "assert addon_utils.check('nte_bridge')[1], 'Addon enable failed in Blender restricted registration context'\n"
+        + "nte_bridge.blender_ui._initialize_cache()\n"
         + "tree = bpy.data.node_groups.new('Installation test', 'NTEBridgeTree')\n"
         + "for kind in ('NTEBridgePart', 'NTEBridgeGroup', 'NTEBridgeCycle', 'NTEBridgeOutput'): tree.nodes.new(kind)\n"
         + "assert len(tree.nodes) == 4\n"
         + "assert core.VERSION == '.'.join(str(n) for n in nte_bridge.bl_info['version'])\n"
         + "assert (Path(nte_bridge.__file__).parent/'vendor/packager_cli/NteBridge.Packager.dll').is_file()\n"
         + "bpy.data.node_groups.remove(tree)\n"
-        + "nte_bridge.unregister()\n"
+        + "addon_utils.disable('nte_bridge', default_set=False)\n"
         + "Path(" + repr(str(report_path)) + ").write_text(json.dumps({'success':True,'version':core.VERSION}), encoding='utf-8')\n",
         encoding="utf-8")
     with (work / "blender.log").open("wb") as log:

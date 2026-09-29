@@ -143,14 +143,14 @@ def stage_assets(manifest_path, ue_report_path, cooked_root, staging_parent=None
     return report
 
 
-def _run(command, log_path, timeout):
+def _run(command, log_path, timeout, *, env=None):
     """File-backed logs avoid pipe deadlocks; timeout terminates the process tree."""
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
     with log_path.open("wb") as log:
         arguments = command if isinstance(command, str) else [str(x) for x in command]
-        process = subprocess.Popen(arguments, stdout=log, stderr=subprocess.STDOUT, **options)
+        process = subprocess.Popen(arguments, stdout=log, stderr=subprocess.STDOUT, env=env, **options)
         try:
             code = process.wait(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
@@ -286,7 +286,14 @@ def package_job(manifest_path, ue_report_path, engine_dir=None, packager_source_
         write_json(request_path, request)
         result["phase"] = "packager"
         command = ["dotnet", adapter] if adapter.suffix.lower() == ".dll" else [adapter]
-        _run(command + ["--job", request_path, "--report", adapter_report_path], run_root / "packager.log", timeout)
+        # The external BuildService uses Path.GetTempPath() for another full
+        # staging copy. Keep that child process's workspace beside this job.
+        temporary_root = run_root / "temp"
+        temporary_root.mkdir()
+        adapter_environment = dict(os.environ)
+        adapter_environment.update({key: str(temporary_root) for key in ("TEMP", "TMP", "TMPDIR")})
+        _run(command + ["--job", request_path, "--report", adapter_report_path],
+             run_root / "packager.log", timeout, env=adapter_environment)
         reply = json.loads(adapter_report_path.read_text(encoding="utf-8-sig"))
         if reply.get("success") is not True or any(reply.get(key) != request[key] for key in ("job_id", "manifest_sha256", "run_id")):
             raise BridgeError("Packager returned a failed or stale report.")

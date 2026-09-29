@@ -143,6 +143,67 @@ def _check_editor_dependencies(unreal):
                             "若使用已打开的 UE，请在插件设置中启用这些插件并重启编辑器。当前尚未修改资产。")
 
 
+_PREVIEW_OWNER_TAG = "NTEBridge.PreviewOwner"
+_PREVIEW_NODE_TAG = "NTEBridge.PreviewBaseColorNode"
+_PREVIEW_OWNER = "NTEBridge.BaseColorPreview.v1"
+
+
+def _apply_material_preview(unreal, material, texture, newly_created, report):
+    """Maintain only our direct BaseColor preview; keep authored shaders intact."""
+    path = _package(material)
+    result = {"material_path": path, "texture_path": _package(texture), "applied": False}
+    report.setdefault("material_previews", []).append(result)
+    if not isinstance(material, unreal.Material):
+        result["reason"] = "材质实例保留原有父材质与参数"
+    else:
+        library = unreal.MaterialEditingLibrary
+        assets = unreal.EditorAssetLibrary
+        count = library.get_num_material_expressions(material)
+        owner = assets.get_metadata_tag(material, _PREVIEW_OWNER_TAG)
+        node = None
+        if owner == _PREVIEW_OWNER:
+            node_path = assets.get_metadata_tag(material, _PREVIEW_NODE_TAG)
+            if node_path:
+                node = unreal.find_object(None, node_path)
+            if (node is None or not isinstance(node, unreal.MaterialExpressionTextureSampleParameter2D)
+                    or assets.get_metadata_tag(node, _PREVIEW_OWNER_TAG) != _PREVIEW_OWNER
+                    or library.get_material_property_input_node(material, unreal.MaterialProperty.MP_BASE_COLOR) != node):
+                result["reason"] = "桥接预览连接已被修改，保留当前材质图"
+        elif count:
+            result["reason"] = "已有材质图，保留用户着色器"
+        if "reason" not in result:
+            if node is None:
+                # v0.2.1 created empty placeholders without metadata. Their empty
+                # expression graph is the only legacy asset we may adopt.
+                node = library.create_material_expression(
+                    material, unreal.MaterialExpressionTextureSampleParameter2D, -400, 0)
+                if node is None:
+                    raise BridgeError("无法创建材质预览节点：" + path)
+                node.set_editor_property("parameter_name", "NTEBridge_PreviewBaseColor")
+                node.set_editor_property("desc", "NTE Bridge · BaseColor preview only")
+                assets.set_metadata_tag(node, _PREVIEW_OWNER_TAG, _PREVIEW_OWNER)
+                assets.set_metadata_tag(material, _PREVIEW_OWNER_TAG, _PREVIEW_OWNER)
+                assets.set_metadata_tag(material, _PREVIEW_NODE_TAG, node.get_path_name())
+            node.set_editor_property("texture", texture)
+            if not library.connect_material_property(node, "RGB", unreal.MaterialProperty.MP_BASE_COLOR):
+                raise BridgeError("无法连接材质预览 Base Color：" + path)
+            if newly_created:
+                roughness = library.create_material_expression(material, unreal.MaterialExpressionConstant, -200, 240)
+                roughness.set_editor_property("r", 0.7)
+                roughness.set_editor_property("desc", "NTE Bridge · preview roughness")
+                assets.set_metadata_tag(roughness, _PREVIEW_OWNER_TAG, _PREVIEW_OWNER)
+                if not library.connect_material_property(roughness, "", unreal.MaterialProperty.MP_ROUGHNESS):
+                    raise BridgeError("无法连接材质预览 Roughness：" + path)
+            library.recompile_material(material)
+            if (library.get_material_property_input_node(material, unreal.MaterialProperty.MP_BASE_COLOR) != node
+                    or node.get_editor_property("texture") != texture):
+                raise BridgeError("材质预览读取校验失败：" + path)
+            result.update(applied=True, node_path=node.get_path_name())
+            return True
+    report["warnings"].append("跳过预览 " + path + "：" + result["reason"] + "。")
+    return False
+
+
 def _run(unreal, manifest, job_dir, report):
     current_project = unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path())
     report["project_file"] = _canonical_file(current_project)
@@ -183,16 +244,20 @@ def _run(unreal, manifest, job_dir, report):
     touched = {}
     def remember(asset, origin, save=True):
         path = _package(asset)
+        save = save or touched.get(path, (None, False))[1]
         touched[path] = (asset, save)
         record = next((item for item in report["assets"] if item["asset_path"] == path), None)
         if record is None:
             record = {"asset_path": path, "asset_type": asset.get_class().get_name(),
                       "origin": origin, "saved": False, "changed": save}
             report["assets"].append(record)
+        else:
+            record["changed"] = record["changed"] or save
         return asset
 
     # All validation above precedes mutations. A failed import can still change in-memory assets;
     # the report explicitly lists partial changes instead of claiming transaction rollback.
+    created_materials = set()
     for path, material in list(materials.items()):
         if material is None:
             report["mutation_started"] = True
@@ -202,6 +267,7 @@ def _run(unreal, manifest, job_dir, report):
             if material is None:
                 raise BridgeError("Could not create material placeholder " + path)
             materials[path] = remember(material, "game_placeholder")
+            created_materials.add(path)
         else:
             remember(material, "game_placeholder", save=False)
 
@@ -281,7 +347,8 @@ def _run(unreal, manifest, job_dir, report):
     for part in manifest["parts"]:
         index = slot_indices[part["slot_key"]]
         slots[index].set_editor_property("material_interface", materials[part["material_path"]])
-        # Stable slot keys stay intact even when multiple slots use the same material.
+        slots[index].set_editor_property("material_slot_name", materials[part["material_path"]].get_name())
+        # Imported identities remain unique even when visible names/materials match.
         report["slot_map"][part["id"]] = index
     mesh.set_editor_property("materials", slots)
     morphs = sorted(str(morph.get_name()) for morph in mesh.get_editor_property("morph_targets"))
@@ -294,6 +361,7 @@ def _run(unreal, manifest, job_dir, report):
     report["slot_signature"] = hashlib.sha256(
         repr(sorted(slot_indices.items())).encode("utf-8")).hexdigest()
 
+    textures = {}
     for entry in manifest.get("textures", []):
         _task(unreal, resolve_source(job_dir, entry["source_file"]), entry["asset_path"], unreal.TextureFactory())
         texture = _asset(unreal, entry["asset_path"], unreal.Texture2D)
@@ -307,10 +375,19 @@ def _run(unreal, manifest, job_dir, report):
         if (texture.get_editor_property("compression_settings") != compression
                 or bool(texture.get_editor_property("srgb")) != settings["srgb"]):
             raise BridgeError("Texture setting readback failed for " + entry["asset_path"])
-        remember(texture, "mod")
+        remember(texture, entry.get("origin", "mod"))
+        textures[entry["asset_path"].casefold()] = texture
         report.setdefault("texture_settings", {})[entry["asset_path"]] = {
             "compression": settings["compression"], "srgb": bool(texture.get_editor_property("srgb")),
             "role": entry["role"]}
+
+    material_paths = {path.casefold(): path for path in materials}
+    for preview in manifest.get("material_previews", []):
+        path = material_paths[preview["material_path"].casefold()]
+        material = materials[path]
+        if _apply_material_preview(unreal, material, textures[preview["texture_path"].casefold()],
+                                   path in created_materials, report):
+            remember(material, "game_placeholder")
 
     if _source_hashes(manifest, job_dir) != report["source_sha256"]:
         raise BridgeError("Source files changed during import; save and packaging stopped")
