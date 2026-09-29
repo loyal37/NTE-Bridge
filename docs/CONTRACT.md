@@ -1,8 +1,12 @@
-# NTE Bridge v0.1 contract
+# NTE Bridge v0.2 contract
 
-Implementation target: Blender 4.5 / UE 5.6.1, Windows. One skeletal mesh and its armature per job. Original files are not saved by export. Runtime feature generation is a later milestone: features may be compiled/previewed, but asset sync must explicitly report them as not generated and packaging must reject unapplied features.
+Implementation target: Blender 4.5.7 / UE 5.6.1, Windows. One skeletal mesh and its armature per job. Original files are not saved by export. Runtime feature generation is a later milestone: features may be compiled/previewed, but asset sync must explicitly report them as not generated and packaging must reject unapplied features.
 
 All modules live in `blender_addon/nte_bridge/`. The package imports without bpy for normal Python tests. Addon registration imports Blender code lazily.
+
+Character discovery reads FModel-style JSON exports under a user-selected source directory. Explicit Package/ObjectPath evidence establishes canonical asset paths. Mesh candidates retain independent Skeleton/PhysicsAsset and ordered material-slot references. Materials retain instance/parent/overlay references, parameters and texture metadata; references without local JSON remain explicitly unavailable rather than reconstructed. Original source JSON is neither modified nor bundled in releases. Discovery must not automatically select all original textures for replacement or replace a slot's original MaterialInterface with its root parent. Multiple mesh candidates and ambiguous material names require selection; successful existing manual mappings and stable part IDs survive rescans.
+
+The primary Blender send operator performs fresh FBX export followed by UE sync as a single asynchronous operation, defaulting to offline commandlet import without requiring an interactive editor. It must not send a previous manifest when the new export fails. First application of a different discovered mesh enables missing reference placeholders; reapplying the same source preserves an explicit advanced opt-out. UE creates and saves assets at exact manifest package paths; game placeholders remain excluded from export_assets. Independent export/existing-job commands remain advanced operations. Installation paths may be auto-detected only from a matching project engine association and complete existing tools; ambiguous installs require manual configuration. Unsaved Blender files use an absolute per-user cache directory for jobs.
 
 Manifest is UTF-8 JSON, schema_version=1. Object references use canonical `/Game/Folder/Asset` package paths (not `.Asset` suffix). A job directory contains `manifest.json`, `meshes/mesh.fbx`, optional `textures/*`, and generated reports. All source_file values are relative, resolved inside the job directory; reject escapes. Never ship source paths or user content in the addon distribution.
 

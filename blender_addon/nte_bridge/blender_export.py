@@ -48,15 +48,18 @@ def graph_dict(tree):
 
 
 def profile_manifest(settings, job_id=None):
-    mesh, rig = settings.mesh, settings.armature
+    # Also guard direct/scripted exports, not only operators in the sidebar.
+    from .blender_ui import _ensure_source_current
+    _ensure_source_current(settings)
+    mesh = settings.mesh
     if mesh is None or mesh.type != 'MESH':
         raise BridgeError("请选择一个角色网格。")
+    rig = mesh.find_armature()
+    settings.armature = rig
     if rig is None or rig.type != 'ARMATURE':
-        raise BridgeError("请选择角色骨架。")
+        raise BridgeError("角色网格尚未绑定骨架；请先设置网格的 Armature 绑定。")
     if settings.bound_mesh != mesh:
         raise BridgeError("角色网格已更换；请刷新部件槽以建立该网格的独立身份。")
-    if mesh.find_armature() != rig:
-        raise BridgeError("网格没有绑定到所选骨架；请先修正 Armature 修改器。")
     unsupported = [modifier.name for modifier in mesh.modifiers
                    if modifier.type != 'ARMATURE' and (modifier.show_viewport or modifier.show_render)]
     if unsupported:

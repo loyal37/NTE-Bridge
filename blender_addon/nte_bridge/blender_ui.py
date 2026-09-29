@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import json
+import re
 import subprocess
 
 import bpy
@@ -9,6 +10,8 @@ from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntPropert
 
 from .blender_export import finish_job, graph_dict, new_id, prepare_job, profile_manifest
 from .core import BridgeError
+from .discovery import scan_character
+from .workflow import default_job_root, detect_engine_dir, detect_packager_source
 
 _ENUM_CACHE = {}
 
@@ -21,12 +24,43 @@ def _rig_poll(self, obj):
     return obj.type == 'ARMATURE'
 
 
+def _catalog_changed(part, context):
+    settings = getattr(getattr(context, 'scene', None), 'nte_bridge', None)
+    entry = settings.material_catalog.get(part.catalog_material) if settings else None
+    if entry:
+        part.automatic_material_path = ''
+        part.material_path = entry.asset_path
+
+
+def _material_path_changed(part, context):
+    if part.automatic_material_path and part.material_path != part.automatic_material_path:
+        part.automatic_material_path = ''
+
+
 class NTEBridgePartEntry(bpy.types.PropertyGroup):
     part_id: StringProperty()
     source_slot: IntProperty(min=0)
     display_name: StringProperty(name="部件名称")
-    material_path: StringProperty(name="UE 材质路径", description="完整 /Game/... 包路径；游戏原材质只占位，不打包")
+    material_path: StringProperty(name="UE 材质路径", update=_material_path_changed,
+        description="完整 /Game/... 包路径；游戏原材质只占位，不打包")
+    automatic_material_path: StringProperty(options={'HIDDEN'})
     source_material: PointerProperty(type=bpy.types.Material)
+    catalog_material: StringProperty(name="选择角色材质", update=_catalog_changed)
+
+
+class NTEBridgeSourceMeshEntry(bpy.types.PropertyGroup):
+    asset_path: StringProperty()
+    display_name: StringProperty()
+
+
+class NTEBridgeMaterialEntry(bpy.types.PropertyGroup):
+    asset_path: StringProperty()
+    display_name: StringProperty()
+    asset_type: StringProperty()
+    parent_path: StringProperty()
+    root_material_path: StringProperty()
+    available: BoolProperty()
+    metadata_json: StringProperty()
 
 
 class NTEBridgeTextureEntry(bpy.types.PropertyGroup):
@@ -218,7 +252,7 @@ class NTEBridgeCycle(_NTEBase, bpy.types.Node):
             op.tree_name = self.id_data.name
             op.node_name = self.name
             op.action = action
-        layout.label(text='v0.1：编译预览，暂不生成游戏切换', icon='INFO')
+        layout.label(text='配置预览，暂不生成游戏切换', icon='INFO')
 
 
 class NTEBridgeOutput(_NTEBase, bpy.types.Node):
@@ -239,90 +273,353 @@ class NTEBridgeOutput(_NTEBase, bpy.types.Node):
         layout.label(text='网格与贴图由角色配置导出')
         layout.label(text='没有切换功能时可保持不连接')
         layout.operator('nte_bridge.validate', text='校验并预览配置', icon='CHECKMARK')
-        layout.operator('nte_bridge.export', text='导出桥接任务', icon='EXPORT')
+        layout.operator('nte_bridge.send', text='发送到 UE', icon='EXPORT')
+
+
+def _source_data(settings):
+    try:
+        return json.loads(settings.source_data) if settings.source_data else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _selected_source(settings):
+    return next((mesh for mesh in _source_data(settings).get('meshes', [])
+                 if mesh['asset_path'] == settings.applied_source_mesh), None)
+
+
+def _resolved_folder(path):
+    value = path.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1].strip()
+    return str(Path(bpy.path.abspath(value)).resolve()) if value else ''
+
+
+def _ensure_source_current(settings):
+    if not settings.source_folder.strip():
+        return  # Existing profiles and manual advanced configuration remain supported.
+    data = _source_data(settings)
+    if _resolved_folder(settings.source_folder).casefold() != str(data.get('folder', '')).casefold():
+        raise BridgeError('角色文件夹已改变或尚未读取，请先读取角色。')
+    candidate = settings.source_meshes.get(settings.source_mesh_choice)
+    if not candidate or candidate.asset_path != settings.applied_source_mesh:
+        raise BridgeError('请选择并使用一个原始骨骼网格，再发送到 UE。')
+
+
+def _fill_material_mappings(settings):
+    """Only fill empty mappings with an unambiguous name match, never slot order."""
+    source = _selected_source(settings)
+    if not source:
+        return 0
+    aliases = {}
+    for slot in source.get('slots', []):
+        path = slot.get('material_path', '')
+        if not path:
+            continue
+        for name in (slot.get('name', ''), path.rsplit('/', 1)[-1]):
+            if name:
+                aliases.setdefault(name, set()).add(path)
+    filled = 0
+    for part in settings.parts:
+        if part.material_path:
+            continue
+        name = part.source_material.name if part.source_material else part.display_name
+        paths = aliases.get(name, set())
+        if not paths:
+            # Blender's duplicate suffix is safe only when the full name is not
+            # itself a source name and the remaining name has one target path.
+            base = re.sub(r'\.\d{3,}$', '', name)
+            paths = aliases.get(base, set()) if base != name else set()
+        if len(paths) == 1:
+            part.material_path = next(iter(paths))
+            entry = next((item for item in settings.material_catalog
+                          if item.asset_path == part.material_path), None)
+            if entry:
+                part.catalog_material = entry.name
+            part.automatic_material_path = part.material_path
+            filled += 1
+    return filled
+
+
+def _refresh_parts(settings):
+    if not settings.mesh:
+        raise BridgeError('请先选择 Blender 角色网格。')
+    same_mesh = settings.bound_mesh == settings.mesh
+    rig = settings.mesh.find_armature()
+    if not same_mesh:
+        settings.character_id = new_id()
+        settings.mesh_id = new_id()
+        settings.graph = None
+        settings.last_manifest = ''
+        settings.last_report = ''
+        settings.armature = rig
+    settings.armature = rig
+    settings.character_id = settings.character_id or new_id()
+    settings.mesh_id = settings.mesh_id or new_id()
+    old = [(p.source_slot, p.source_material, p.part_id, p.display_name,
+            p.material_path, p.catalog_material, p.automatic_material_path) for p in settings.parts] if same_mesh else []
+    retained, used = [], set()
+    for index, slot in enumerate(settings.mesh.material_slots):
+        candidates = [i for i, item in enumerate(old) if i not in used and item[1] == slot.material]
+        at_index = next((i for i in candidates if old[i][0] == index), None)
+        if at_index is not None:
+            match = at_index
+        elif len(candidates) == 1:
+            match = candidates[0]
+        elif candidates:
+            raise BridgeError('重复材质槽的顺序已改变，无法确定部件身份；请恢复槽顺序后再刷新。')
+        else:
+            match = None
+        if match is not None:
+            used.add(match)
+            retained.append(old[match][2:])
+        else:
+            # A replaced material can retain its slot identity, but no old
+            # mapping. Never take an identity whose material moved elsewhere.
+            replaced = next((i for i, item in enumerate(old)
+                             if i not in used and item[0] == index
+                             and not any(item[1] == current.material for current in settings.mesh.material_slots)), None)
+            if replaced is not None:
+                used.add(replaced)
+                item = old[replaced]
+                label = item[3]
+                if item[1] and label == item[1].name:
+                    label = slot.name or '部件 %d' % index
+                retained.append((item[2], label, '', '', ''))
+            else:
+                retained.append((new_id(), slot.name or '部件 %d' % index, '', '', ''))
+    settings.parts.clear()
+    for index, slot in enumerate(settings.mesh.material_slots):
+        part = settings.parts.add()
+        part.part_id, part.display_name, path, choice, automatic = retained[index]
+        part.name = part.part_id
+        part.source_slot = index
+        part.source_material = slot.material
+        part.catalog_material = choice
+        part.material_path = path  # Retain an explicit manual override over the catalog selection.
+        part.automatic_material_path = automatic
+    settings.active_part = min(settings.active_part, max(0, len(settings.parts) - 1))
+    settings.bound_mesh = settings.mesh
+    if not settings.graph:
+        settings.graph = bpy.data.node_groups.new('NTE · ' + settings.mesh.name, 'NTEBridgeTree')
+        settings.graph.graph_id = new_id()
+        settings.graph.use_fake_user = True
+    valid_ids = {part.part_id for part in settings.parts}
+    for node in list(settings.graph.nodes):
+        if (node.bl_idname == 'NTEBridgePart' and node.part_id not in valid_ids
+                and not any(socket.is_linked for socket in node.outputs)):
+            settings.graph.nodes.remove(node)
+    existing = {n.part_id for n in settings.graph.nodes if n.bl_idname == 'NTEBridgePart'}
+    for index, part in enumerate(settings.parts):
+        if part.part_id not in existing:
+            node = settings.graph.nodes.new('NTEBridgePart')
+            node.part_id = part.part_id
+            node.label = part.display_name
+            node.location = (0, -index * 95)
+    if not any(n.bl_idname == 'NTEBridgeOutput' for n in settings.graph.nodes):
+        node = settings.graph.nodes.new('NTEBridgeOutput')
+        node.location = (720, 0)
+    _fill_material_mappings(settings)
+
+
+def _mesh_changed(settings, context):
+    if settings.mesh and not settings.busy:
+        try:
+            _refresh_parts(settings)
+            settings.status = '已读取 Blender 网格；展开材质与部件核对映射。'
+        except Exception as error:
+            settings.status = str(error)
 
 
 class NTEBridgeSettings(bpy.types.PropertyGroup):
     character_id: StringProperty()
     mesh_id: StringProperty()
-    mesh: PointerProperty(name="角色网格", type=bpy.types.Object, poll=_mesh_poll)
+    mesh: PointerProperty(name="Blender 网格", type=bpy.types.Object, poll=_mesh_poll, update=_mesh_changed)
     bound_mesh: PointerProperty(type=bpy.types.Object)
     armature: PointerProperty(name="角色骨架", type=bpy.types.Object, poll=_rig_poll)
     graph: PointerProperty(name="节点图", type=bpy.types.NodeTree)
+    source_folder: StringProperty(name="解包的角色文件夹", subtype='DIR_PATH',
+        description="例如 E:\\NTE mods\\078_Nitsa；读取其中导出的 JSON 资源信息")
+    source_data: StringProperty(options={'HIDDEN'})
+    source_meshes: CollectionProperty(type=NTEBridgeSourceMeshEntry)
+    source_mesh_choice: StringProperty(name="原始骨骼网格")
+    applied_source_mesh: StringProperty()
+    material_catalog: CollectionProperty(type=NTEBridgeMaterialEntry)
+    catalog_choice: StringProperty(name="角色材质与母材质")
+    discovery_status: StringProperty()
     project_file: StringProperty(name="UE 工程", subtype='FILE_PATH')
     mesh_path: StringProperty(name="网格包路径", description="如 /Game/Characters/Player/Test/Test")
     skeleton_path: StringProperty(name="骨架包路径")
     physics_path: StringProperty(name="物理资产路径", description="可留空；指定时作为占位资源，不打包")
-    create_placeholders: BoolProperty(name="允许创建缺失占位资源", default=False,
-        description="仅供 UE 导入引用；占位材质、骨架、物理资产不会进入打包清单")
+    create_placeholders: BoolProperty(name="自动创建缺失的原资源占位", default=False,
+        description="读取并使用新角色时自动开启：在原路径补齐材质、骨架和物理资产引用；占位资源不会打包")
     parts: CollectionProperty(type=NTEBridgePartEntry)
     active_part: IntProperty(min=0)
     textures: CollectionProperty(type=NTEBridgeTextureEntry)
     active_texture: IntProperty(min=0)
     job_root: StringProperty(name="桥接任务目录", subtype='DIR_PATH', default='//NTEBridgeJobs')
     engine_dir: StringProperty(name="UE 安装目录", subtype='DIR_PATH')
-    sync_mode: EnumProperty(name="同步方式", items=[
-        ('remote', '发送到已打开的 UE', '需要目标工程启用本机 Python 远程执行'),
-        ('commandlet', 'UE 关闭时后台导入', '目标工程必须关闭；后台启动命令行编辑器导入')])
+    sync_mode: EnumProperty(name="同步方式", default='commandlet',
+        description="后台导入要求目标工程关闭；自动启动 UE 命令行编辑器，完成后退出",
+        items=[('commandlet', '后台导入（无需打开 UE）', '目标工程必须关闭；自动启动后台 UE 并在导入完成后退出', 1),
+               ('remote', '发送到已打开的 UE', '可选：需要目标工程启用本机 Python 远程执行', 0)])
     packager_source: StringProperty(name="外部打包器目录", subtype='DIR_PATH',
         description="包含 NteMorphTargetPatch.exe、retoc.exe 和 Oodle DLL 的目录")
     package_output: StringProperty(name="Mod 输出目录", subtype='DIR_PATH')
     mod_name: StringProperty(name="Mod 名称", default='NTEBridgeMod')
     last_manifest: StringProperty(name="最近任务", subtype='FILE_PATH')
     last_report: StringProperty(name="最近报告", subtype='FILE_PATH')
-    status: StringProperty(default='选择网格和骨架，填写 UE 路径，再刷新部件槽。')
+    status: StringProperty(default='先读取解包的角色文件夹，再选择 Blender 网格。')
     busy: BoolProperty(default=False, options={'SKIP_SAVE'})
+
+
+class NTEBRIDGE_OT_scan_character(bpy.types.Operator):
+    bl_idname = 'nte_bridge.scan_character'
+    bl_label = '读取角色'
+    bl_description = '从解包 JSON 读取网格、骨架、物理资产以及材质引用和参数'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return not context.scene.nte_bridge.busy
+
+    def execute(self, context):
+        settings = context.scene.nte_bridge
+        try:
+            if not settings.source_folder.strip():
+                raise BridgeError('请选择解包的角色文件夹。')
+            result = scan_character(_resolved_folder(settings.source_folder))
+            if not result.get('meshes'):
+                raise BridgeError('文件夹中未找到可识别的骨骼网格 JSON，请检查解包导出内容。')
+            settings.source_data = json.dumps(result, ensure_ascii=False)
+            old_choice = settings.source_mesh_choice
+            settings.source_meshes.clear()
+            for mesh in result['meshes']:
+                entry = settings.source_meshes.add()
+                entry.asset_path = mesh['asset_path']
+                entry.display_name = mesh['name']
+                entry.name = mesh['name'] + '  |  ' + mesh['asset_path']
+            settings.material_catalog.clear()
+            for material in sorted(result.get('materials', []), key=lambda item: (not item.get('available', False), item['asset_path'])):
+                entry = settings.material_catalog.add()
+                entry.asset_path = material['asset_path']
+                entry.display_name = material['name']
+                entry.name = material['name'] + '  |  ' + material['asset_path']
+                entry.asset_type = material.get('type', '')
+                entry.parent_path = material.get('parent_path', '')
+                entry.root_material_path = material.get('root_material_path', '')
+                entry.available = material.get('available', False)
+                entry.metadata_json = json.dumps(material, ensure_ascii=False)
+            if len(settings.source_meshes) == 1:
+                settings.source_mesh_choice = settings.source_meshes[0].name
+                _apply_source(settings)
+            elif settings.source_meshes.get(old_choice):
+                settings.source_mesh_choice = old_choice
+                if settings.source_meshes[old_choice].asset_path == settings.applied_source_mesh:
+                    _apply_source(settings)
+            else:
+                settings.source_mesh_choice = ''
+            loaded = sum(item.available for item in settings.material_catalog)
+            settings.discovery_status = '%d 个网格 · %d 份材质信息' % (len(settings.source_meshes), loaded)
+            settings.status = ('已读取角色；请选择原始骨骼网格并点击使用。'
+                               if not settings.source_mesh_choice else '角色信息已更新；已有部件和手动映射已保留。')
+            self.report({'INFO'}, settings.discovery_status)
+            return {'FINISHED'}
+        except Exception as error:
+            settings.status = str(error)
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+
+def _apply_source(settings):
+    entry = settings.source_meshes.get(settings.source_mesh_choice)
+    source = next((item for item in _source_data(settings).get('meshes', [])
+                   if entry and item['asset_path'] == entry.asset_path), None)
+    if not source:
+        raise BridgeError('请先选择读取到的原始骨骼网格。')
+    if not source.get('skeleton_path'):
+        raise BridgeError('该网格 JSON 缺少骨架引用，请补充解包信息或使用高级手动配置。')
+    for part in settings.parts:
+        if part.automatic_material_path and part.material_path == part.automatic_material_path:
+            part.material_path = ''
+            part.catalog_material = ''
+            part.automatic_material_path = ''
+    same_source = settings.applied_source_mesh == source['asset_path']
+    if not same_source:
+        settings.create_placeholders = True
+    for prop, key in [('mesh_path', 'asset_path'), ('skeleton_path', 'skeleton_path'),
+                      ('physics_path', 'physics_path')]:
+        if not same_source or not getattr(settings, prop):
+            setattr(settings, prop, source.get(key, ''))
+    settings.applied_source_mesh = source['asset_path']
+    if not same_source:
+        settings.last_manifest = ''
+        settings.last_report = ''
+    filled = _fill_material_mappings(settings)
+    settings.status = '已使用 %s；自动匹配 %d 个未映射材质槽。' % (source['name'], filled)
+
+
+class NTEBRIDGE_OT_apply_source(bpy.types.Operator):
+    bl_idname = 'nte_bridge.apply_source'
+    bl_label = '使用此网格'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return not context.scene.nte_bridge.busy
+
+    def execute(self, context):
+        settings = context.scene.nte_bridge
+        try:
+            if _resolved_folder(settings.source_folder).casefold() != str(_source_data(settings).get('folder', '')).casefold():
+                raise BridgeError('目录已改变，请先重新读取角色。')
+            _apply_source(settings)
+            self.report({'INFO'}, settings.status)
+            return {'FINISHED'}
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
 
 
 class NTEBRIDGE_OT_refresh_slots(bpy.types.Operator):
     bl_idname = 'nte_bridge.refresh_slots'
-    bl_label = '刷新部件槽 / 初始化节点图'
-    bl_description = '按槽索引保留已有映射；修改槽顺序后必须重新核对。不会合并相同材质槽'
+    bl_label = '刷新部件槽'
+    bl_description = '保留独立槽身份及已有映射，只为名称唯一匹配的空槽补全材质；槽顺序变化后请核对'
     bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return not context.scene.nte_bridge.busy
 
     def execute(self, context):
         settings = context.scene.nte_bridge
-        if not settings.mesh:
-            self.report({'ERROR'}, '请先选择角色网格')
+        try:
+            _refresh_parts(settings)
+            mapped = sum(bool(part.material_path) for part in settings.parts)
+            settings.status = '已识别 %d 个独立槽，已映射 %d 个。' % (len(settings.parts), mapped)
+            self.report({'INFO'}, settings.status)
+            return {'FINISHED'}
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
-        if not settings.armature:
-            settings.armature = settings.mesh.find_armature()
-        same_mesh = settings.bound_mesh == settings.mesh
-        if not same_mesh:
-            settings.character_id = new_id()
-            settings.mesh_id = new_id()
-            settings.graph = None
-            settings.last_manifest = ''
-            settings.last_report = ''
-            if settings.mesh.find_armature():
-                settings.armature = settings.mesh.find_armature()
-        settings.character_id = settings.character_id or new_id()
-        settings.mesh_id = settings.mesh_id or new_id()
-        old = {p.source_slot: (p.part_id, p.display_name, p.material_path) for p in settings.parts} if same_mesh else {}
-        settings.parts.clear()
-        for index, slot in enumerate(settings.mesh.material_slots):
-            part = settings.parts.add()
-            part.part_id, part.display_name, part.material_path = old.get(index, (new_id(), slot.name or '部件 %d' % index, ''))
-            part.name = part.part_id
-            part.source_slot = index
-            part.source_material = slot.material
-        settings.bound_mesh = settings.mesh
-        if not settings.graph:
-            settings.graph = bpy.data.node_groups.new('NTE · ' + settings.mesh.name, 'NTEBridgeTree')
-            settings.graph.graph_id = new_id()
-            settings.graph.use_fake_user = True
-        existing = {n.part_id for n in settings.graph.nodes if n.bl_idname == 'NTEBridgePart'}
-        for index, part in enumerate(settings.parts):
-            if part.part_id not in existing:
-                node = settings.graph.nodes.new('NTEBridgePart')
-                node.part_id = part.part_id
-                node.label = part.display_name
-                node.location = (0, -index * 95)
-        if not any(n.bl_idname == 'NTEBridgeOutput' for n in settings.graph.nodes):
-            node = settings.graph.nodes.new('NTEBridgeOutput')
-            node.location = (720, 0)
-        settings.status = '已识别 %d 个独立槽；请逐槽核对 UE 材质路径。' % len(settings.parts)
-        self.report({'INFO'}, settings.status)
+
+
+class NTEBRIDGE_OT_source_report(bpy.types.Operator):
+    bl_idname = 'nte_bridge.source_report'
+    bl_label = '查看完整材质信息'
+    bl_description = '查看材质参数、贴图引用、母材质链和未找到的依赖'
+    material_name: StringProperty()
+
+    def execute(self, context):
+        settings = context.scene.nte_bridge
+        entry = settings.material_catalog.get(self.material_name)
+        data = json.loads(entry.metadata_json) if entry else _source_data(settings)
+        report = bpy.data.texts.get('NTE Bridge 角色资源.json') or bpy.data.texts.new('NTE Bridge 角色资源.json')
+        report.clear()
+        report.write(json.dumps(data, ensure_ascii=False, indent=2))
+        if context.area:
+            context.area.type = 'TEXT_EDITOR'
+            context.area.spaces.active.text = report
         return {'FINISHED'}
 
 
@@ -405,12 +702,48 @@ class NTEBRIDGE_OT_validate(bpy.types.Operator):
             return {'CANCELLED'}
 
 
+def _engine_path(settings):
+    engine_dir = settings.engine_dir.strip() or detect_engine_dir(bpy.path.abspath(settings.project_file))
+    if not engine_dir:
+        raise BridgeError('未找到工程对应的 UE，请在高级设置指定 UE 安装目录。')
+    engine = Path(bpy.path.abspath(engine_dir)).resolve()
+    python = engine / 'Engine/Binaries/ThirdParty/Python3/Win64/python.exe'
+    if not python.is_file():
+        raise BridgeError('UE 安装目录中找不到 Python；请在高级设置选择包含 Engine 的目录。')
+    return engine, python
+
+
+def _job_defaults(settings):
+    if not settings.job_root.strip() or (settings.job_root == '//NTEBridgeJobs' and not bpy.data.filepath):
+        settings.job_root = default_job_root()
+
+
+def _task_command(manifest, engine, python, action, report, mode='remote'):
+    command = [str(python), str(Path(__file__).with_name('cli.py')), action,
+               '--manifest', str(manifest), '--engine-dir', str(engine), '--report', str(report)]
+    if action == 'sync':
+        command += ['--mode', mode]
+    return command
+
+
+def _completed_report(settings, report_path, code):
+    if not report_path.is_file():
+        raise BridgeError('没有收到任务报告；请在高级设置查看任务日志。')
+    report = json.loads(report_path.read_text(encoding='utf-8-sig'))
+    if code or not report.get('success'):
+        raise BridgeError('任务失败：' + '; '.join(str(e) for e in report.get('errors', ['详见报告'])))
+    if report.get('features_applied') is False:
+        settings.status = '资产同步成功；运行时功能未生成，该任务不能打包。'
+    else:
+        settings.status = '任务完成；结果与警告可在高级设置的报告中查看。'
+
+
 class _WorkerModal:
     @classmethod
     def poll(cls, context):
         return not context.scene.nte_bridge.busy
 
-    def _launch(self, context, command, log_path):
+    def _spawn(self, command, log_path):
         self._log = Path(log_path).open('w', encoding='utf-8')
         try:
             self._process = subprocess.Popen(command, stdout=self._log, stderr=subprocess.STDOUT,
@@ -418,7 +751,10 @@ class _WorkerModal:
         except Exception:
             self._log.close()
             raise
+
+    def _launch(self, context, command, log_path):
         self._settings = context.scene.nte_bridge
+        self._spawn(command, log_path)
         self._settings.busy = True
         self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
         context.window_manager.modal_handler_add(self)
@@ -429,30 +765,43 @@ class _WorkerModal:
             self.report({'WARNING'}, '任务进行中；取消请使用任务进程，不在写入中强制关闭。')
         if event.type != 'TIMER' or self._process.poll() is None:
             return {'PASS_THROUGH'}
-        context.window_manager.event_timer_remove(self._timer)
         self._log.close()
-        self._settings.busy = False
         try:
-            self._complete(self._process.returncode)
-            self.report({'INFO'}, self._settings.status)
-            return {'FINISHED'}
+            continuation = self._complete(self._process.returncode)
+            if continuation:
+                self._spawn(*continuation)
+                if context.area:
+                    context.area.tag_redraw()
+                return {'PASS_THROUGH'}
+            result, report_type = {'FINISHED'}, {'INFO'}
         except Exception as error:
             self._settings.status = str(error)
-            self.report({'ERROR'}, str(error))
-            return {'CANCELLED'}
+            result, report_type = {'CANCELLED'}, {'ERROR'}
+        context.window_manager.event_timer_remove(self._timer)
+        self._settings.busy = False
+        if context.area:
+            context.area.tag_redraw()
+        self.report(report_type, self._settings.status)
+        return result
 
 
 class NTEBRIDGE_OT_export(_WorkerModal, bpy.types.Operator):
     bl_idname = 'nte_bridge.export'
-    bl_label = '导出桥接任务'
-    bl_description = '导出临时副本网格与纹理；不会保存或改写原始 .blend'
+    bl_label = '仅导出桥接任务'
+    bl_description = '高级操作：只导出临时副本网格与贴图，不发送到 UE'
 
     def execute(self, context):
+        settings = context.scene.nte_bridge
+        settings.last_manifest = ''
+        settings.last_report = ''
         try:
+            _ensure_source_current(settings)
+            _job_defaults(settings)
             self._job = prepare_job(context)
-            context.scene.nte_bridge.status = '正在后台导出 FBX 临时副本…'
+            settings.status = '正在后台导出 FBX 临时副本…'
             return self._launch(context, self._job['command'], self._job['job_dir'] / 'export.log')
         except Exception as error:
+            settings.status = str(error)
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
 
@@ -461,51 +810,75 @@ class NTEBRIDGE_OT_export(_WorkerModal, bpy.types.Operator):
         self._settings.last_manifest = str(path)
         pending = bool(self._job['manifest']['features'])
         self._settings.status = ('导出完成；切换功能仅编译预览，尚未生成，不能打包。' if pending
-                                 else '导出完成，可发送到 UE。')
+                                 else '导出完成；可在高级设置发送该任务。')
+
+
+class NTEBRIDGE_OT_send(_WorkerModal, bpy.types.Operator):
+    bl_idname = 'nte_bridge.send'
+    bl_label = '发送到 UE'
+    bl_description = '导出当前 Blender 配置和模型，随后自动同步到指定 UE 工程'
+
+    def execute(self, context):
+        settings = context.scene.nte_bridge
+        settings.last_manifest = ''
+        settings.last_report = ''
+        try:
+            _ensure_source_current(settings)
+            self._engine, self._python = _engine_path(settings)
+            self._sync_mode = settings.sync_mode
+            _job_defaults(settings)
+            self._job = prepare_job(context)
+            self._phase = 'export'
+            settings.status = '1/2 正在导出当前模型…'
+            return self._launch(context, self._job['command'], self._job['job_dir'] / 'export.log')
+        except Exception as error:
+            settings.status = str(error)
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+    def _complete(self, code):
+        if self._phase == 'export':
+            manifest = finish_job(self._job, code)
+            self._settings.last_manifest = str(manifest)
+            self._report = manifest.parent / 'sync_report.json'
+            self._settings.last_report = str(self._report)
+            self._phase = 'sync'
+            self._settings.status = '2/2 正在同步到 UE…'
+            command = _task_command(manifest, self._engine, self._python, 'sync', self._report, self._sync_mode)
+            return command, manifest.parent / 'sync.log'
+        _completed_report(self._settings, self._report, code)
 
 
 class NTEBRIDGE_OT_worker(_WorkerModal, bpy.types.Operator):
     bl_idname = 'nte_bridge.worker'
     bl_label = '运行桥接任务'
-    action: EnumProperty(items=[('sync', '发送到 UE', ''), ('package', '烘焙并打包', '')])
+    action: EnumProperty(items=[('sync', '发送已有任务到 UE', ''), ('package', '烘焙并打包', '')])
 
     def execute(self, context):
         settings = context.scene.nte_bridge
         try:
             manifest = Path(bpy.path.abspath(settings.last_manifest)).resolve()
             if not settings.last_manifest or not manifest.is_file():
-                raise BridgeError('请先成功导出桥接任务。')
-            engine = Path(bpy.path.abspath(settings.engine_dir)).resolve()
-            python = engine / 'Engine/Binaries/ThirdParty/Python3/Win64/python.exe'
-            if not python.is_file():
-                raise BridgeError('UE 安装目录中找不到 Python；请选择包含 Engine 的引擎目录。')
+                raise BridgeError('请先发送到 UE，或在高级设置选择已导出的桥接任务。')
+            engine, python = _engine_path(settings)
             self._report = manifest.parent / (self.action + '_report.json')
-            command = [str(python), str(Path(__file__).with_name('cli.py')), self.action,
-                       '--manifest', str(manifest), '--engine-dir', str(engine), '--report', str(self._report)]
-            if self.action == 'sync':
-                command += ['--mode', settings.sync_mode]
+            command = _task_command(manifest, engine, python, self.action, self._report, settings.sync_mode)
             if self.action == 'package':
-                if not settings.packager_source or not settings.package_output:
-                    raise BridgeError('请填写外部打包器目录和 Mod 输出目录。')
-                command += ['--packager-source', bpy.path.abspath(settings.packager_source),
+                packager = settings.packager_source.strip() or detect_packager_source()
+                if not packager or not settings.package_output:
+                    raise BridgeError('请选择 Mod 输出目录；无法自动找到打包器时请在高级设置指定。')
+                command += ['--packager-source', bpy.path.abspath(packager),
                             '--output-dir', bpy.path.abspath(settings.package_output), '--mod-name', settings.mod_name]
             settings.status = '正在后台' + ('同步 UE 资产…' if self.action == 'sync' else '烘焙并打包…')
             settings.last_report = str(self._report)
             return self._launch(context, command, manifest.parent / (self.action + '.log'))
         except Exception as error:
+            settings.status = str(error)
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
 
     def _complete(self, code):
-        if not self._report.is_file():
-            raise BridgeError('没有收到任务报告；请查看任务日志。')
-        report = json.loads(self._report.read_text(encoding='utf-8-sig'))
-        if code or not report.get('success'):
-            raise BridgeError('任务失败：' + '; '.join(str(e) for e in report.get('errors', ['详见报告'])))
-        if report.get('features_applied') is False:
-            self._settings.status = '资产同步成功；运行时功能未生成，该任务不能打包。'
-        else:
-            self._settings.status = '任务完成；结果与警告详见报告。'
+        _completed_report(self._settings, self._report, code)
 
 
 class NTEBRIDGE_UL_parts(bpy.types.UIList):
@@ -520,56 +893,239 @@ class NTEBRIDGE_UL_textures(bpy.types.UIList):
         layout.label(text=item.role)
 
 
+def _wide_prop(layout, data, prop, label=None):
+    layout.label(text=label or data.bl_rna.properties[prop].name)
+    layout.prop(data, prop, text='')
+
+
+def _wrapped(layout, text, context, icon='NONE'):
+    width = max(22, int((getattr(context.region, 'width', 300) - 36) / 7))
+    lines, line, count = [], '', 0
+    for char in str(text):
+        step = 2 if ord(char) > 255 else 1
+        if count + step > width:
+            lines.append(line)
+            line, count = '', 0
+        line += char
+        count += step
+    if line:
+        lines.append(line)
+    for index, line in enumerate(lines):
+        layout.label(text=line, icon=icon if index == 0 else 'NONE')
+
+
+def _panel_column(panel, context):
+    column = panel.layout.column()
+    column.enabled = not context.scene.nte_bridge.busy
+    return column
+
+
+def _material_details(layout, entry, context):
+    if not entry:
+        return
+    if not entry.available:
+        _wrapped(layout, '已有游戏引用；本文件夹没有该材质的参数资料。', context)
+    else:
+        data = json.loads(entry.metadata_json)
+        parameters = data.get('parameters', {})
+        count = sum(len(value) if isinstance(value, (dict, list)) else 1 for value in parameters.values())
+        layout.label(text='%d 项参数 · %d 项贴图引用' % (count, len(data.get('textures', []))))
+    layout.operator('nte_bridge.source_report', text='查看参数与贴图信息', icon='TEXT').material_name = entry.name
+
+
 class NTEBRIDGE_PT_main(bpy.types.Panel):
-    bl_label = 'NTE Bridge · 异环桥接'
+    bl_label = 'NTE Bridge · 角色'
     bl_idname = 'NTEBRIDGE_PT_main'
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'NTE Bridge'
 
     def draw(self, context):
-        layout = self.layout
         settings = context.scene.nte_bridge
-        layout.label(text='v0.1 · 资源桥接；功能节点仅编译预览', icon='INFO')
-        column = layout.column()
-        column.enabled = not settings.busy
-        for prop in ('mesh', 'armature', 'project_file', 'mesh_path', 'skeleton_path', 'physics_path'):
-            column.prop(settings, prop)
-        column.prop(settings, 'create_placeholders')
+        column = _panel_column(self, context)
+        _wide_prop(column, settings, 'source_folder')
+        column.operator('nte_bridge.scan_character', icon='FILE_REFRESH')
+        if settings.source_meshes:
+            if len(settings.source_meshes) > 1:
+                column.label(text='原始骨骼网格（%d 个）' % len(settings.source_meshes))
+                column.prop_search(settings, 'source_mesh_choice', settings, 'source_meshes', text='')
+                selected = settings.source_meshes.get(settings.source_mesh_choice)
+                if not selected or selected.asset_path != settings.applied_source_mesh:
+                    row = column.row()
+                    row.enabled = bool(selected)
+                    row.operator('nte_bridge.apply_source', text='使用此网格', icon='CHECKMARK')
+            source = _selected_source(settings)
+            if source:
+                if len(settings.source_meshes) == 1:
+                    _wrapped(column, source['name'], context, 'OUTLINER_DATA_MESH')
+                refs = ['骨架已读取' if settings.skeleton_path else '缺少骨架引用']
+                if settings.physics_path:
+                    refs.append('物理资产已读取')
+                column.label(text=' · '.join(refs), icon='CHECKMARK')
+            else:
+                column.label(text='请选择要替换的原始网格', icon='INFO')
+        column.separator(factor=0.5)
+        _wide_prop(column, settings, 'mesh')
+        if settings.mesh:
+            rig = settings.mesh.find_armature()
+            if rig:
+                column.label(text='已识别绑定骨架：' + rig.name, icon='ARMATURE_DATA')
+            else:
+                column.label(text='网格尚未绑定骨架', icon='ERROR')
+            mapped = sum(bool(part.material_path) for part in settings.parts)
+            column.label(text='材质槽 %d / %d 已映射' % (mapped, len(settings.parts)),
+                         icon='CHECKMARK' if mapped and mapped == len(settings.parts) else 'INFO')
+        if settings.source_folder and _resolved_folder(settings.source_folder).casefold() != str(_source_data(settings).get('folder', '')).casefold():
+            column.label(text='目录已改变，请重新读取角色', icon='INFO')
+
+
+class _NTEChildPanel:
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'NTE Bridge'
+    bl_parent_id = 'NTEBRIDGE_PT_main'
+    bl_options = {'DEFAULT_CLOSED'}
+
+
+class NTEBRIDGE_PT_materials(_NTEChildPanel, bpy.types.Panel):
+    bl_label = '材质与部件'
+    bl_idname = 'NTEBRIDGE_PT_materials'
+    bl_order = 0
+
+    def draw(self, context):
+        settings = context.scene.nte_bridge
+        column = _panel_column(self, context)
         column.operator('nte_bridge.refresh_slots', icon='FILE_REFRESH')
-        column.template_list('NTEBRIDGE_UL_parts', '', settings, 'parts', settings, 'active_part', rows=4)
-        if settings.parts and settings.active_part < len(settings.parts):
-            part = settings.parts[settings.active_part]
-            column.prop(part, 'display_name')
-            row = column.row()
-            row.enabled = False
-            row.prop(part, 'source_material', text='源材质')
-            column.prop(part, 'material_path')
-        column.separator()
-        column.label(text='只加入需要替换的贴图')
-        column.template_list('NTEBRIDGE_UL_textures', '', settings, 'textures', settings, 'active_texture', rows=3)
+        if not settings.parts:
+            column.label(text='选择 Blender 网格后自动读取材质槽')
+            return
+        column.template_list('NTEBRIDGE_UL_parts', '', settings, 'parts', settings, 'active_part',
+                             rows=min(5, max(2, len(settings.parts))))
+        if settings.active_part >= len(settings.parts):
+            return
+        part = settings.parts[settings.active_part]
+        column.prop(part, 'display_name')
+        _wrapped(column, 'Blender 材质：' + (part.source_material.name if part.source_material else '空槽'), context)
+        if settings.material_catalog:
+            column.label(text='选择原游戏材质（母材质）')
+            column.prop_search(part, 'catalog_material', settings, 'material_catalog', text='')
+        _wide_prop(column, part, 'material_path', '当前 UE 材质路径')
+        entry = next((item for item in settings.material_catalog if item.asset_path == part.material_path), None)
+        _material_details(column, entry, context)
+
+
+class NTEBRIDGE_PT_catalog(_NTEChildPanel, bpy.types.Panel):
+    bl_label = '原游戏材质（母材质）'
+    bl_idname = 'NTEBRIDGE_PT_catalog'
+    bl_order = 1
+
+    def draw(self, context):
+        settings = context.scene.nte_bridge
+        column = _panel_column(self, context)
+        loaded = sum(entry.available for entry in settings.material_catalog)
+        if not settings.material_catalog:
+            column.label(text='读取角色后查看材质参数与贴图引用')
+            return
+        column.label(text='%d 份材质资料 · %d 项外部引用' % (loaded, len(settings.material_catalog) - loaded))
+        column.prop_search(settings, 'catalog_choice', settings, 'material_catalog', text='')
+        entry = settings.material_catalog.get(settings.catalog_choice)
+        if entry:
+            _wrapped(column, entry.asset_path, context)
+            _material_details(column, entry, context)
+        column.operator('nte_bridge.source_report', text='查看角色资源清单', icon='TEXT')
+
+
+class NTEBRIDGE_PT_textures(_NTEChildPanel, bpy.types.Panel):
+    bl_label = '替换贴图'
+    bl_idname = 'NTEBRIDGE_PT_textures'
+    bl_order = 2
+
+    def draw(self, context):
+        settings = context.scene.nte_bridge
+        column = _panel_column(self, context)
+        if settings.textures:
+            column.template_list('NTEBRIDGE_UL_textures', '', settings, 'textures', settings, 'active_texture',
+                                 rows=min(4, max(2, len(settings.textures))))
+        else:
+            column.label(text='沿用原贴图时无需添加')
         row = column.row(align=True)
-        for action, text in [('ADD', '添加贴图'), ('REMOVE', '删除贴图')]:
-            row.operator('nte_bridge.edit_texture', text=text).action = action
+        row.operator('nte_bridge.edit_texture', text='添加贴图', icon='ADD').action = 'ADD'
+        if settings.textures:
+            row.operator('nte_bridge.edit_texture', text='移除', icon='REMOVE').action = 'REMOVE'
         if settings.textures and settings.active_texture < len(settings.textures):
             entry = settings.textures[settings.active_texture]
-            for prop in ('file_path', 'asset_path', 'role'):
-                column.prop(entry, prop)
-        column.separator()
+            _wide_prop(column, entry, 'file_path')
+            _wide_prop(column, entry, 'asset_path')
+            column.prop(entry, 'role', text='')
+
+
+class NTEBRIDGE_PT_nodes(_NTEChildPanel, bpy.types.Panel):
+    bl_label = '功能节点'
+    bl_idname = 'NTEBRIDGE_PT_nodes'
+    bl_order = 3
+
+    def draw(self, context):
+        column = _panel_column(self, context)
+        _wrapped(column, '节点目前用于配置预览，接入运行时生成后才能打包切换功能。', context, 'INFO')
         column.operator('nte_bridge.open_graph', icon='NODETREE')
         column.operator('nte_bridge.validate', icon='CHECKMARK')
-        column.prop(settings, 'job_root')
-        column.operator('nte_bridge.export', icon='EXPORT')
-        column.prop(settings, 'last_manifest')
-        column.prop(settings, 'engine_dir')
-        column.prop(settings, 'sync_mode')
-        column.operator('nte_bridge.worker', text='发送最近任务到 UE', icon='IMPORT').action = 'sync'
+
+
+class NTEBRIDGE_PT_send(_NTEChildPanel, bpy.types.Panel):
+    bl_label = '发送到 UE'
+    bl_idname = 'NTEBRIDGE_PT_send'
+    bl_order = 4
+    bl_options = set()
+
+    def draw(self, context):
+        settings = context.scene.nte_bridge
+        column = _panel_column(self, context)
+        _wide_prop(column, settings, 'project_file')
+        column.prop(settings, 'sync_mode', text='')
+        row = column.row()
+        row.scale_y = 1.3
+        row.operator('nte_bridge.send', text='发送到 UE', icon='EXPORT')
+        _wrapped(self.layout, settings.status, context, 'TIME' if settings.busy else 'INFO')
+
+
+class NTEBRIDGE_PT_package(_NTEChildPanel, bpy.types.Panel):
+    bl_label = '烘焙与打包'
+    bl_idname = 'NTEBRIDGE_PT_package'
+    bl_order = 5
+
+    def draw(self, context):
+        settings = context.scene.nte_bridge
+        column = _panel_column(self, context)
+        _wide_prop(column, settings, 'package_output')
+        column.prop(settings, 'mod_name')
+        row = column.row()
+        row.enabled = bool(settings.last_manifest)
+        row.operator('nte_bridge.worker', text='烘焙并打包', icon='PACKAGE').action = 'package'
+
+
+class NTEBRIDGE_PT_advanced(_NTEChildPanel, bpy.types.Panel):
+    bl_label = '高级设置'
+    bl_idname = 'NTEBRIDGE_PT_advanced'
+    bl_order = 6
+
+    def draw(self, context):
+        settings = context.scene.nte_bridge
+        column = _panel_column(self, context)
+        column.label(text='资源路径（从角色资料自动读取）')
+        for prop in ('mesh_path', 'skeleton_path', 'physics_path'):
+            _wide_prop(column, settings, prop)
+        column.prop(settings, 'create_placeholders')
         column.separator()
-        for prop in ('packager_source', 'package_output', 'mod_name'):
-            column.prop(settings, prop)
-        column.operator('nte_bridge.worker', text='烘焙并打包最近任务', icon='PACKAGE').action = 'package'
-        layout.label(text=settings.status, icon='TIME' if settings.busy else 'INFO')
-        layout.prop(settings, 'last_report')
+        column.label(text='工具路径（留空时自动查找）')
+        for prop in ('engine_dir', 'packager_source'):
+            _wide_prop(column, settings, prop)
+        _wide_prop(column, settings, 'job_root')
+        column.separator()
+        column.label(text='独立步骤与诊断')
+        column.operator('nte_bridge.export', text='仅导出当前配置', icon='EXPORT')
+        _wide_prop(column, settings, 'last_manifest')
+        column.operator('nte_bridge.worker', text='发送已有任务到 UE', icon='IMPORT').action = 'sync'
+        _wide_prop(column, settings, 'last_report')
 
 
 def _add_menu(self, context):
@@ -583,13 +1139,16 @@ def _add_menu(self, context):
             op.use_transform = True
 
 
-CLASSES = (NTEBridgePartEntry, NTEBridgeTextureEntry, NTEBridgeStateEntry, NTEBridgeSocket,
+CLASSES = (NTEBridgePartEntry, NTEBridgeSourceMeshEntry, NTEBridgeMaterialEntry,
+           NTEBridgeTextureEntry, NTEBridgeStateEntry, NTEBridgeSocket,
            NTEBridgeTree, NTEBridgePart, NTEBridgeGroup, NTEBridgeCycle, NTEBridgeOutput,
-           NTEBridgeSettings, NTEBRIDGE_OT_refresh_slots, NTEBRIDGE_OT_edit_state,
+           NTEBridgeSettings, NTEBRIDGE_OT_scan_character, NTEBRIDGE_OT_apply_source,
+           NTEBRIDGE_OT_refresh_slots, NTEBRIDGE_OT_source_report, NTEBRIDGE_OT_edit_state,
            NTEBRIDGE_OT_edit_texture, NTEBRIDGE_OT_open_graph, NTEBRIDGE_OT_validate,
-           NTEBRIDGE_OT_export, NTEBRIDGE_OT_worker, NTEBRIDGE_UL_parts,
-           NTEBRIDGE_UL_textures, NTEBRIDGE_PT_main)
-
+           NTEBRIDGE_OT_export, NTEBRIDGE_OT_send, NTEBRIDGE_OT_worker, NTEBRIDGE_UL_parts,
+           NTEBRIDGE_UL_textures, NTEBRIDGE_PT_main, NTEBRIDGE_PT_materials,
+           NTEBRIDGE_PT_catalog, NTEBRIDGE_PT_textures, NTEBRIDGE_PT_nodes,
+           NTEBRIDGE_PT_send, NTEBRIDGE_PT_package, NTEBRIDGE_PT_advanced)
 
 def register():
     for cls in CLASSES:
