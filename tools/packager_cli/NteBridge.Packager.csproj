@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+  <Target Name="RequireExternalSource" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(PackagerSourceDir)/src/NteModPackager/Services/BuildService.cs')" Text="Set PackagerSourceDir to the external NTE Mod Packager source checkout." />
+  </Target>
+  <ItemGroup>
+    <Compile Include="$(PackagerSourceDir)/src/NteModPackager/Services/BuildService.cs" Link="External/BuildService.cs" />
+    <Compile Include="$(PackagerSourceDir)/src/NteModPackager/Services/ProcessRunner.cs" Link="External/ProcessRunner.cs" />
+    <Compile Include="$(PackagerSourceDir)/src/NteModPackager/Models/BuildModels.cs" Link="External/BuildModels.cs" />
+  </ItemGroup>
+</Project>
