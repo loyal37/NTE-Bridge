@@ -10,10 +10,13 @@ from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, PointerProperty, StringProperty
 
 from .blender_export import finish_job, graph_dict, new_id, prepare_job, profile_manifest
-from .core import BridgeError
+from .core import BridgeError, write_json
 from .discovery import scan_character
 from .workflow import detect_engine_dir, detect_packager_source
 from .blender_cache import _directory, ensure_cache, selected_manifest
+from .blender_packaging import (TYPE_ITEMS, TYPE_LABELS, TYPE_ICONS, asset_dialog_width, asset_visible, character_folder,
+    clear_cook, cook_excluded_assets, default_character_folder, load_cooked_assets, resolved_project,
+    selection_request, size_label, verified_cook, visible_assets, worker_python)
 
 _ENUM_CACHE = {}
 
@@ -72,6 +75,17 @@ class NTEBridgeTextureEntry(bpy.types.PropertyGroup):
     role: EnumProperty(name="用途", items=[
         ('BASE_COLOR', '漫射 · BC7 / sRGB', ''), ('ID_TEX', 'ID · BC7 / 线性', ''),
         ('LIGHT_MAP', 'LightMap · BC7 / 线性', ''), ('NORMAL', '法线 · BC5 / 线性', '')])
+
+
+class NTEBridgeCookedAssetEntry(bpy.types.PropertyGroup):
+    asset_path: StringProperty()
+    asset_type: StringProperty()
+    size_bytes: StringProperty()
+    size_text: StringProperty()
+    selected: BoolProperty(name='导出此资产', default=False)
+    packable: BoolProperty(default=False)
+    dependency: BoolProperty(default=False)
+    reason: StringProperty()
 
 
 class NTEBridgeStateEntry(bpy.types.PropertyGroup):
@@ -434,6 +448,7 @@ def _mesh_changed(settings, context):
 
 
 def _cache_changed(settings, context):
+    clear_cook(settings)
     settings.last_manifest = ''
     settings.last_report = ''
     settings.job_root = ''
@@ -442,6 +457,16 @@ def _cache_changed(settings, context):
             settings.job_root = str(_directory(settings.cache_root) / 'Jobs')
         except BridgeError:
             pass
+
+
+def _cook_context_changed(settings, context):
+    clear_cook(settings)
+
+
+def _cook_role_changed(settings, context):
+    # Changing characters must never silently retain another role's override.
+    settings.cook_use_custom = False
+    clear_cook(settings)
 
 
 @persistent
@@ -454,6 +479,12 @@ def _restore_cache(_unused=None):
             settings.job_root = ''
             settings.last_manifest = ''
             settings.last_report = ''
+            clear_cook(settings)
+        if settings.cook_report:
+            try:
+                verified_cook(settings)
+            except (BridgeError, OSError, ValueError, KeyError):
+                clear_cook(settings)
 
 
 def _initialize_cache():
@@ -470,7 +501,7 @@ class NTEBridgeSettings(bpy.types.PropertyGroup):
     bound_mesh: PointerProperty(type=bpy.types.Object)
     armature: PointerProperty(name="角色骨架", type=bpy.types.Object, poll=_rig_poll)
     graph: PointerProperty(name="节点图", type=bpy.types.NodeTree)
-    source_folder: StringProperty(name="解包的角色文件夹", subtype='DIR_PATH',
+    source_folder: StringProperty(name="解包的角色文件夹", subtype='DIR_PATH', update=_cook_role_changed,
         description="例如 E:\\NTE mods\\078_Nitsa；读取其中导出的 JSON 资源信息")
     source_data: StringProperty(options={'HIDDEN'})
     source_meshes: CollectionProperty(type=NTEBridgeSourceMeshEntry)
@@ -479,8 +510,8 @@ class NTEBridgeSettings(bpy.types.PropertyGroup):
     material_catalog: CollectionProperty(type=NTEBridgeMaterialEntry)
     catalog_choice: StringProperty(name="角色材质与母材质")
     discovery_status: StringProperty()
-    project_file: StringProperty(name="UE 工程", subtype='FILE_PATH')
-    mesh_path: StringProperty(name="网格包路径", description="如 /Game/Characters/Player/Test/Test")
+    project_file: StringProperty(name="UE 工程", subtype='FILE_PATH', update=_cook_context_changed)
+    mesh_path: StringProperty(name="网格包路径", description="如 /Game/Characters/Player/Test/Test", update=_cook_role_changed)
     skeleton_path: StringProperty(name="骨架包路径")
     physics_path: StringProperty(name="物理资产路径", description="可留空；指定时作为占位资源，不打包")
     create_placeholders: BoolProperty(name="自动创建缺失的原资源占位", default=False,
@@ -502,6 +533,21 @@ class NTEBridgeSettings(bpy.types.PropertyGroup):
         description="包含 NteMorphTargetPatch.exe、retoc.exe 和 Oodle DLL 的目录")
     package_output: StringProperty(name="Mod 输出目录", subtype='DIR_PATH')
     mod_name: StringProperty(name="Mod 名称", default='NTEBridgeMod')
+    cook_use_custom: BoolProperty(name='自定义 UE 烘焙目录', default=False, update=_cook_context_changed,
+        description='默认烘焙当前角色的完整目录；开启后可选择工程中的其他目录')
+    cook_folder: StringProperty(name='UE 烘焙目录', update=_cook_context_changed,
+        description='完整 UE 资源目录，例如 /Game/Characters/Player/078_Nitsa')
+    cook_report: StringProperty(name='最近烘焙清单', subtype='FILE_PATH')
+    cook_report_sha256: StringProperty(options={'HIDDEN'})
+    cook_assets: CollectionProperty(type=NTEBridgeCookedAssetEntry)
+    cook_active_asset: IntProperty(min=0)
+    cook_search: StringProperty(name='搜索资产', description='按名称、类型或资源路径搜索')
+    cook_type: EnumProperty(name='资产类型', items=TYPE_ITEMS, default='ALL')
+    cook_show_dependencies: BoolProperty(name='显示目录外依赖', default=False,
+        description='显示烘焙时生成的共享资产及引擎依赖；不可打包的引用仍禁止勾选')
+    cook_export_directory: StringProperty(name='烘焙资产导出目录', subtype='DIR_PATH',
+        default='D:/Neverness to Everness Mod Loader/cook/packager/xg/HT/Content/Characters',
+        description='所选 cooked 文件导出到此 Characters 目录并保留子目录，随后自动打包')
     last_manifest: StringProperty(name="最近任务", subtype='FILE_PATH')
     last_report: StringProperty(name="最近报告", subtype='FILE_PATH')
     status: StringProperty(default='先读取解包的角色文件夹，再选择 Blender 网格。')
@@ -767,7 +813,7 @@ def _completed_report(settings, report_path, code):
     if code or not report.get('success'):
         raise BridgeError('任务失败：' + '; '.join(str(e) for e in report.get('errors', ['详见报告'])))
     if report.get('features_applied') is False:
-        settings.status = '资产同步成功；运行时功能未生成，该任务不能打包。'
+        settings.status = '资产同步成功；Blender 节点切换尚未生成，请在 UE 完成所需切换后再烘焙。'
     else:
         settings.status = '任务完成；结果与警告可在高级设置的报告中查看。'
 
@@ -843,7 +889,7 @@ class NTEBRIDGE_OT_export(_WorkerModal, bpy.types.Operator):
         path = finish_job(self._job, code)
         self._settings.last_manifest = str(path)
         pending = bool(self._job['manifest']['features'])
-        self._settings.status = ('导出完成；切换功能仅编译预览，尚未生成，不能打包。' if pending
+        self._settings.status = ('导出完成；Blender 节点切换尚未生成，请在 UE 完成所需切换后再烘焙。' if pending
                                  else '导出完成；可在高级设置发送该任务。')
 
 
@@ -911,6 +957,158 @@ class NTEBRIDGE_OT_worker(_WorkerModal, bpy.types.Operator):
 
     def _complete(self, code):
         _completed_report(self._settings, self._report, code)
+
+
+class NTEBRIDGE_OT_cook(_WorkerModal, bpy.types.Operator):
+    bl_idname = 'nte_bridge.cook'
+    bl_label = '烘焙角色目录'
+    bl_description = '独立烘焙所选 UE 目录；无需重新导出或发送 Blender 网格'
+
+    def execute(self, context):
+        settings = context.scene.nte_bridge
+        clear_cook(settings)
+        try:
+            project = resolved_project(settings)
+            folder = character_folder(settings)
+            engine_dir = settings.engine_dir.strip() or detect_engine_dir(str(project))
+            if not engine_dir:
+                raise BridgeError('未找到工程对应的 UE，请在高级设置指定 UE 安装目录。')
+            engine = Path(bpy.path.abspath(engine_dir)).resolve()
+            root = ensure_cache(settings).parent / 'Cooks' / ('run-' + new_id())
+            root.mkdir(parents=True, exist_ok=False)
+            request = root / 'cook_request.json'
+            self._report = root / 'cook_report.json'
+            write_json(request, {'schema_version': 1, 'project_file': str(project),
+                                'character_folder': folder, 'excluded_assets': cook_excluded_assets(settings)})
+            command = [str(worker_python()), str(Path(__file__).with_name('cli.py')), 'cook',
+                       '--request', str(request), '--engine-dir', str(engine), '--report', str(self._report)]
+            settings.last_report = str(self._report)
+            settings.status = '正在后台烘焙 ' + folder + '…'
+            return self._launch(context, command, root / 'cook.log')
+        except Exception as error:
+            settings.status = str(error)
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+    def _complete(self, code):
+        _completed_report(self._settings, self._report, code)
+        report = load_cooked_assets(self._settings, self._report)
+        self._settings.status = '烘焙完成：%d 个资产；打开资产窗口，勾选后导出并打包。' % len(report['assets'])
+
+
+class NTEBRIDGE_OT_select_filtered_cooked(bpy.types.Operator):
+    bl_idname = 'nte_bridge.select_filtered_cooked'
+    bl_label = '选择当前列表'
+    action: EnumProperty(items=[('ALL', '全选当前筛选', ''), ('NONE', '全不选当前筛选', '')])
+
+    @classmethod
+    def poll(cls, context):
+        return not context.scene.nte_bridge.busy
+
+    def execute(self, context):
+        settings = context.scene.nte_bridge
+        for entry in visible_assets(settings):
+            if entry.packable:
+                entry.selected = self.action == 'ALL'
+        return {'FINISHED'}
+
+
+class NTEBRIDGE_UL_cooked_assets(bpy.types.UIList):
+    def filter_items(self, context, data, propname):
+        return ([self.bitflag_filter_item if asset_visible(data, entry) else 0
+                 for entry in getattr(data, propname)], [])
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        checkbox = row.row(align=True)
+        checkbox.enabled = item.packable
+        checkbox.prop(item, 'selected', text='')
+        name = row.split(factor=0.33)
+        name.label(text=item.asset_path.rsplit('/', 1)[-1], icon=TYPE_ICONS.get(item.asset_type, 'FILE'))
+        kind = name.split(factor=0.20)
+        kind.label(text=TYPE_LABELS.get(item.asset_type, item.asset_type))
+        size = kind.split(factor=0.17)
+        size.label(text=item.size_text)
+        size.label(text=item.asset_path, icon='NONE' if item.packable else 'LOCKED')
+
+
+class NTEBRIDGE_OT_select_cooked_assets(_WorkerModal, bpy.types.Operator):
+    bl_idname = 'nte_bridge.select_cooked_assets'
+    bl_label = '导出所选资产并打包'
+    bl_description = '选择本次烘焙资产，导出到指定目录后自动调用外部打包器'
+
+    def invoke(self, context, event):
+        try:
+            verified_cook(context.scene.nte_bridge)
+            return context.window_manager.invoke_props_dialog(self, width=asset_dialog_width(context),
+                confirm_text='导出所选资产并打包', title='烘焙资产 · 选择导出')
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+    def draw(self, context):
+        settings = context.scene.nte_bridge
+        layout = self.layout
+        layout.label(text=character_folder(settings), icon='FILE_FOLDER')
+        filters = layout.row(align=True)
+        filters.prop(settings, 'cook_search', text='', icon='VIEWZOOM')
+        filters.prop(settings, 'cook_type', text='')
+        selection = layout.row(align=True)
+        selection.prop(settings, 'cook_show_dependencies')
+        selection.operator('nte_bridge.select_filtered_cooked', text='全选当前筛选').action = 'ALL'
+        selection.operator('nte_bridge.select_filtered_cooked', text='全不选当前筛选').action = 'NONE'
+        header = layout.row().split(factor=0.35)
+        header.label(text='选择 / 资产名称')
+        kind = header.split(factor=0.20)
+        kind.label(text='类型')
+        size = kind.split(factor=0.17)
+        size.label(text='大小')
+        size.label(text='UE 资源路径')
+        layout.template_list('NTEBRIDGE_UL_cooked_assets', '', settings, 'cook_assets', settings,
+                             'cook_active_asset', rows=12, maxrows=16)
+        selected = [entry for entry in settings.cook_assets if entry.selected and entry.packable]
+        layout.label(text='当前显示 %d 项 · 已选 %d 项 · 总可选 %d 项 · %s' % (
+            len(visible_assets(settings)), len(selected), sum(entry.packable for entry in settings.cook_assets),
+            size_label(sum(int(entry.size_bytes) for entry in selected))))
+        layout.label(text='原母材质、骨架和物理占位不可选；隐藏的已选资产仍包含在本次导出中', icon='INFO')
+        if settings.cook_assets and settings.cook_active_asset < len(settings.cook_assets):
+            active = settings.cook_assets[settings.cook_active_asset]
+            if asset_visible(settings, active):
+                layout.label(text=active.asset_path, icon='FILE_FOLDER')
+                if active.reason:
+                    layout.label(text=active.reason, icon='INFO' if active.packable else 'LOCKED')
+        layout.separator()
+        _wide_prop(layout, settings, 'cook_export_directory')
+        _wide_prop(layout, settings, 'package_output', 'Mod 成品输出目录')
+        layout.prop(settings, 'mod_name')
+
+    def execute(self, context):
+        settings = context.scene.nte_bridge
+        try:
+            selection = selection_request(settings)
+            packager = settings.packager_source.strip() or detect_packager_source()
+            if not packager or not settings.package_output.strip():
+                raise BridgeError('请选择 Mod 成品输出目录；无法自动找到打包器时请在高级设置指定。')
+            root = Path(settings.cook_report).parent / ('selection-' + new_id())
+            root.mkdir(exist_ok=False)
+            path = root / 'selection.json'
+            self._report = root / 'package_report.json'
+            write_json(path, selection)
+            command = [str(worker_python()), str(Path(__file__).with_name('cli.py')), 'package-selection',
+                       '--selection', str(path), '--packager-source', bpy.path.abspath(packager),
+                       '--output-dir', bpy.path.abspath(settings.package_output), '--mod-name', settings.mod_name,
+                       '--report', str(self._report)]
+            settings.last_report = str(self._report)
+            settings.status = '正在导出 %d 个所选资产并打包…' % len(selection['selected_assets'])
+            return self._launch(context, command, root / 'package.log')
+        except Exception as error:
+            settings.status = str(error)
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+    def _complete(self, code):
+        _completed_report(self._settings, self._report, code)
+        self._settings.status = '所选资产已导出并打包完成。'
 
 
 class NTEBRIDGE_UL_parts(bpy.types.UIList):
@@ -1076,7 +1274,8 @@ class NTEBRIDGE_PT_textures(_NTEChildPanel, bpy.types.Panel):
         settings = context.scene.nte_bridge
         column = _panel_column(self, context)
         column.label(text='已连接的漫射自动用于 UE 预览')
-        column.label(text='这里只添加需要打包的替换贴图')
+        column.label(text='其他需要导入 UE 的贴图在这里添加')
+        column.label(text='是否打包在烘焙资产窗口选择')
         if settings.textures:
             column.template_list('NTEBRIDGE_UL_textures', '', settings, 'textures', settings, 'active_texture',
                                  rows=min(4, max(2, len(settings.textures))))
@@ -1130,11 +1329,19 @@ class NTEBRIDGE_PT_package(_NTEChildPanel, bpy.types.Panel):
     def draw(self, context):
         settings = context.scene.nte_bridge
         column = _panel_column(self, context)
-        _wide_prop(column, settings, 'package_output')
-        column.prop(settings, 'mod_name')
+        column.prop(settings, 'cook_use_custom')
+        if settings.cook_use_custom:
+            _wide_prop(column, settings, 'cook_folder')
+        else:
+            _wrapped(column, default_character_folder(settings) or '读取角色后自动确定 UE 目录', context, 'FILE_FOLDER')
+        column.operator('nte_bridge.cook', text='烘焙角色目录', icon='RENDER_STILL')
+        column.separator()
         row = column.row()
-        row.enabled = bool(settings.last_manifest)
-        row.operator('nte_bridge.worker', text='烘焙并打包', icon='PACKAGE').action = 'package'
+        row.enabled = bool(settings.cook_report)
+        row.operator('nte_bridge.select_cooked_assets', text='选择烘焙资产…', icon='ASSET_MANAGER')
+        if settings.cook_report:
+            local = sum(not entry.dependency for entry in settings.cook_assets)
+            column.label(text='当前目录 %d 项 · 目录外依赖 %d 项' % (local, len(settings.cook_assets) - local))
 
 
 class NTEBRIDGE_PT_advanced(_NTEChildPanel, bpy.types.Panel):
@@ -1172,6 +1379,7 @@ class NTEBRIDGE_PT_advanced(_NTEChildPanel, bpy.types.Panel):
         paths = column.column()
         paths.enabled = False
         _wide_prop(paths, settings, 'last_report')
+        _wide_prop(paths, settings, 'cook_report')
 
 
 def _add_menu(self, context):
@@ -1186,12 +1394,13 @@ def _add_menu(self, context):
 
 
 CLASSES = (NTEBridgePartEntry, NTEBridgeSourceMeshEntry, NTEBridgeMaterialEntry,
-           NTEBridgeTextureEntry, NTEBridgeStateEntry, NTEBridgeSocket,
+           NTEBridgeTextureEntry, NTEBridgeCookedAssetEntry, NTEBridgeStateEntry, NTEBridgeSocket,
            NTEBridgeTree, NTEBridgePart, NTEBridgeGroup, NTEBridgeCycle, NTEBridgeOutput,
            NTEBridgeSettings, NTEBRIDGE_OT_scan_character, NTEBRIDGE_OT_apply_source,
            NTEBRIDGE_OT_refresh_slots, NTEBRIDGE_OT_source_report, NTEBRIDGE_OT_edit_state,
            NTEBRIDGE_OT_edit_texture, NTEBRIDGE_OT_open_graph, NTEBRIDGE_OT_validate,
            NTEBRIDGE_OT_export, NTEBRIDGE_OT_send, NTEBRIDGE_OT_worker, NTEBRIDGE_UL_parts,
+           NTEBRIDGE_OT_cook, NTEBRIDGE_OT_select_filtered_cooked, NTEBRIDGE_UL_cooked_assets, NTEBRIDGE_OT_select_cooked_assets,
            NTEBRIDGE_UL_textures, NTEBRIDGE_PT_main, NTEBRIDGE_PT_materials,
            NTEBRIDGE_PT_catalog, NTEBRIDGE_PT_textures, NTEBRIDGE_PT_nodes,
            NTEBRIDGE_PT_send, NTEBRIDGE_PT_package, NTEBRIDGE_PT_advanced)

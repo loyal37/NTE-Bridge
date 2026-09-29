@@ -1,6 +1,6 @@
-# NTE Bridge v0.2 contract
+# NTE Bridge v0.3 contract
 
-Implementation target: Blender 4.5.7 / UE 5.6.1, Windows. One skeletal mesh and its armature per job. Original files are not saved by export. Runtime feature generation is a later milestone: features may be compiled/previewed, but asset sync must explicitly report them as not generated and packaging must reject unapplied features.
+Implementation target: Blender 4.5.7 / UE 5.6.1, Windows. One skeletal mesh and its armature per import job. Original files are not saved by export. Runtime feature generation is a later milestone: features may be compiled/previewed, but asset sync must explicitly report them as not generated and legacy manifest packaging must reject unapplied features. Independent folder cooking snapshots saved UE content, including features the user has created with UE tools; it does not generate Blender nodes.
 
 All modules live in `blender_addon/nte_bridge/`. The package imports without bpy for normal Python tests. Addon registration imports Blender code lazily.
 
@@ -55,4 +55,37 @@ UE report additionally includes `manifest_sha256` (exact JSON bytes) and `source
 
 `saved_asset_sha256` maps paths relative to the project's `Content/` directory to the exact saved `.uasset` and existing `.uexp/.ubulk/.uptnl` hashes for every export asset. Cook and staging recheck the complete set so an older job cannot package assets overwritten by a newer job. A different source manifest alone does not prove which version is currently stored in UE.
 
-Packaging module: validate manifest and successful same-job UE report; refuse nonempty unapplied features; stage exactly export_assets from cooked `<Project>/Content` with sidecars into a new job directory; invoke existing packager service via external-source .NET CLI adapter. Packaging UI may run worker process; do not block Blender drawing with long cook. Existing editor needs saved imported assets before cook. Reports must distinguish cook, staging and packager failures.
+Legacy packaging module/API: validate manifest and successful same-job UE report; refuse nonempty unapplied features; stage exactly export_assets from cooked `<Project>/Content` with sidecars into a new job directory; invoke existing packager service via external-source .NET CLI adapter. This API remains compatible for existing scripts. Blender's primary packaging workflow uses the separate folder snapshot and explicit selection below.
+
+## Independent character cooking and asset selection (v0.3.0)
+
+Blender exposes two operations: cook a UE character folder, then open an asset selection dialog to export selected cooked assets and automatically package them. Default folder follows the current discovered character, including its mesh subfolders; an explicit custom `/Game/...` directory may select a different character. Cooking requires a saved project and existing content folder, not a recent successful bridge import. It refuses an open target project and leaves the project descriptor unchanged. Every cook uses a new directory under the selected cache's `Cooks` tree.
+
+`cooking.cook_character(request_path, engine_dir, report_path=None, timeout=1800)` receives a UTF-8 request:
+
+```json
+{
+  "schema_version": 1,
+  "project_file": "D:/ueproject/HT/HT.uproject",
+  "character_folder": "/Game/Characters/Player/078_Nitsa",
+  "excluded_assets": ["/Game/Characters/Player/078_Nitsa/Ml_player_078_Nitsa_01"]
+}
+```
+
+The UE AssetRegistry supplies true asset classes. A fresh cook processes the entire directory recursively; imported manifests do not limit the inventory. The report binds the request fingerprint, project, folder and cook ID to an asset inventory with package paths, classes, selectable status/reason, byte totals, file counts and exact sidecar SHA256/size records. All assets initially have `default_selected=false`. Materials, Skeletons, PhysicsAssets, unsupported/editor-only classes and explicitly identified original reference materials cannot be selected. Existing custom MaterialInstanceConstant, Blueprint and AnimBlueprint assets can be selected. Automatic diffuse textures are ordinary Texture2D assets in this inventory: they remain unchecked until the user chooses them.
+
+`packaging.package_selection(selection_path, ...)` receives:
+
+```json
+{
+  "schema_version": 1,
+  "cook_report": "D:/NTEBridgeCache/Cooks/example/cook_report.json",
+  "cook_report_sha256": "<SHA256 of the exact report bytes>",
+  "selected_assets": ["/Game/Characters/Player/078_Nitsa/SM_Nitsa"],
+  "export_directory": "D:/Neverness to Everness Mod Loader/cook/packager/xg/HT/Content/Characters"
+}
+```
+
+Selection is resolved against that completed cook snapshot, not mutable live UE content or arbitrary loose files. Empty selections, stale reports, changed cooked files, missing required `.uasset`, unsafe paths and forbidden assets fail before invoking the external packager. Each selected package carries its verified `.uasset/.uexp/.ubulk/.uptnl` files; unchecked dependencies never join the package automatically. Changing Blender's cache/project/folder invalidates the displayed selection.
+
+The export directory represents the project's `Content/Characters` mount: `/Game/Characters/Player/A/SM_A` becomes `<export_directory>/Player/A/SM_A.uasset`. Assets outside Characters retain their original position under the same Content root. The persistent export copy does not remove unrelated previous exports. Packaging consumes a fresh verified mirror of only the current selection, so old persistent files cannot leak into a new Mod. Export and package reports identify failures by phase. Final output is separately configured; previous `.pak/.utoc/.ucas` files are not overwritten. Child TEMP/TMP/TMPDIR stay inside the active cache. Reusing a cook for another selection does not invoke UE again.

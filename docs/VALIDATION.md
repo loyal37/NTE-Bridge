@@ -1,4 +1,17 @@
-# v0.2.2 验证记录
+# v0.3.0 验证记录
+
+日期：2026-09-29。使用 Blender 4.5.7 LTS 和隔离 UE 5.6.1 工程。
+
+- 81 项纯 Python 测试通过，包括独立角色目录烘焙、真实资产类及完整文件快照、原引用禁选、只暂存勾选项、报告/文件变化拒绝、导出前预检、原路径导出、旧旁文件更新和未选旧包隔离。旧导入与 manifest 打包接口回归保留。
+- Blender 4.5.7 的新界面 19 项检查通过：角色根目录及 fire 子网格默认范围、自定义其他角色、无网格/无最近导入任务烘焙、初始全部不选、原引用和自定义 MI 区分、搜索/类型/目录外依赖筛选、只选择可见可打包项、独立导出位置、打包不启动 UE、缓存/工程/范围变更和报告变化清除旧选择，以及高 DPI 窗口宽度和隐藏资产详情。原缓存 10 项集成回归通过。
+- 在真实 Blender 窗口绘制资产选择界面，载入实际 UE 烘焙报告；默认显示 12 个角色资产，目录外 212 个依赖保留在报告并默认隐藏。
+- 实际测试工程具有一个网格、四种贴图、原 Material/MI/Skeleton/PhysicsAsset、自定义 MI、Blueprint 和 AnimBlueprint；完整角色目录烘焙成功。另一个名称前缀相同的角色目录不会误入范围，切换后无需重新导入即可单独烘焙。
+- 实际选中网格、漫射、法线、自定义 MI、Blueprint、AnimBlueprint 共 6 项，按 `<工程>/Content/Characters/Player/<角色>` 导出其完整旁文件后调用现有外部打包器。实际生成 `.pak/.utoc/.ucas`；retoc 回读容器清单与 6 项选择完全一致。未选贴图、原引用和人为保留在持久导出目录中的旧资产均未混入。打包后原烘焙快照的全部文件指纹不变。
+- 实际序列化贴图回读仍为漫射/ID/LightMap `PF_BC7`、法线 `PF_BC5`。独立测试源文件和工程描述文件未变，未操作用户原 HT 资产。
+
+本地证据：`artifacts/unit-v0.3.0.log`、`artifacts/cooking_ui_smoke/latest_result.json`、`artifacts/cache_smoke/latest_result.json`、`artifacts/ui_030/asset-dialog.png`、`artifacts/cooking_fixture/run-fd91160ce6b5/integration_package.json`、同目录 `container_manifest.json` 和 `texture_formats.json`。仅推送 main，不创建标签或 Release。游戏内表现未在本次验证范围内。
+
+## v0.2.2 验证记录
 
 日期：2026-09-29。Blender 固定 4.5.7 LTS；实际导入使用隔离的 UE 5.6.1 工程。
 

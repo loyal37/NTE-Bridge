@@ -35,9 +35,42 @@ def main(argv=None):
     package.add_argument("--cooked-root")
     package.add_argument("--skip-cook", action="store_true")
     package.add_argument("--timeout", type=int, default=1800)
+    cook = sub.add_parser('cook')
+    cook.add_argument('--request', required=True)
+    cook.add_argument('--engine-dir', required=True)
+    cook.add_argument('--report')
+    cook.add_argument('--timeout', type=int, default=1800)
+    selected = sub.add_parser('package-selection')
+    selected.add_argument('--selection', required=True)
+    selected.add_argument('--packager-source', required=True)
+    selected.add_argument('--packager-tools')
+    selected.add_argument('--output-dir', required=True)
+    selected.add_argument('--mod-name', required=True)
+    selected.add_argument('--adapter-path')
+    selected.add_argument('--report')
+    selected.add_argument('--timeout', type=int, default=1800)
     args = parser.parse_args(argv)
     report_path = Path(args.report) if args.report else None
     result = {"success": False, "errors": [], "warnings": []}
+    if args.command in {'cook', 'package-selection'}:
+        # Independent cooked snapshots do not need a Blender/import manifest.
+        # These APIs own safe report writing, including rejection of input paths.
+        try:
+            if args.command == 'cook':
+                from nte_bridge.cooking import cook_character
+                result = cook_character(args.request, args.engine_dir, report_path=report_path, timeout=args.timeout)
+            else:
+                from nte_bridge.packaging import package_selection
+                result = package_selection(args.selection, args.packager_source,
+                    packager_tools_dir=args.packager_tools, output_dir=args.output_dir,
+                    mod_name=args.mod_name, adapter_path=args.adapter_path,
+                    timeout=args.timeout, report_path=report_path)
+        except Exception as exc:
+            result.update(success=False, errors=[str(exc)], error_type=type(exc).__name__)
+            if not isinstance(exc, BridgeError):
+                result['traceback'] = traceback.format_exc()
+        print(json.dumps(result, ensure_ascii=True, indent=2))
+        return 0 if result.get('success') else 1
     try:
         if report_path and report_path.resolve() == Path(args.manifest).resolve():
             report_path = None
