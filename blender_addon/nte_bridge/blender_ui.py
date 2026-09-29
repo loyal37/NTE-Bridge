@@ -9,7 +9,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, PointerProperty, StringProperty
 
-from .blender_export import finish_job, graph_dict, new_id, prepare_job, profile_manifest
+from .blender_export import finish_job, graph_dict, new_id, prepare_job, profile_manifest, release_job
 from .core import BridgeError, write_json
 from .discovery import scan_character
 from .workflow import detect_engine_dir, detect_packager_source
@@ -799,8 +799,9 @@ def _job_defaults(settings):
 
 
 def _task_command(manifest, engine, python, action, report, mode='remote'):
+    job_id = json.loads(Path(manifest).read_text(encoding='utf-8'))['job_id']
     command = [str(python), str(Path(__file__).with_name('cli.py')), action,
-               '--manifest', str(manifest), '--engine-dir', str(engine), '--report', str(report)]
+               '--manifest', str(manifest), '--job-id', job_id, '--engine-dir', str(engine), '--report', str(report)]
     if action == 'sync':
         command += ['--mode', mode]
     return command
@@ -840,6 +841,13 @@ class _WorkerModal:
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
+    def _release_workspace(self):
+        release_job(getattr(self, '_job', None))
+        lock = getattr(self, '_job_lock', None)
+        if lock:
+            self._job_lock = None
+            lock.__exit__(None, None, None)
+
     def modal(self, context, event):
         if event.type == 'ESC':
             self.report({'WARNING'}, '任务进行中；取消请使用任务进程，不在写入中强制关闭。')
@@ -857,6 +865,7 @@ class _WorkerModal:
         except Exception as error:
             self._settings.status = str(error)
             result, report_type = {'CANCELLED'}, {'ERROR'}
+        self._release_workspace()
         context.window_manager.event_timer_remove(self._timer)
         self._settings.busy = False
         if context.area:
@@ -881,6 +890,7 @@ class NTEBRIDGE_OT_export(_WorkerModal, bpy.types.Operator):
             settings.status = '正在后台导出 FBX 临时副本…'
             return self._launch(context, self._job['command'], self._job['job_dir'] / 'export.log')
         except Exception as error:
+            self._release_workspace()
             settings.status = str(error)
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
@@ -912,13 +922,14 @@ class NTEBRIDGE_OT_send(_WorkerModal, bpy.types.Operator):
             settings.status = '1/2 正在导出当前模型…'
             return self._launch(context, self._job['command'], self._job['job_dir'] / 'export.log')
         except Exception as error:
+            self._release_workspace()
             settings.status = str(error)
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
 
     def _complete(self, code):
         if self._phase == 'export':
-            manifest = finish_job(self._job, code)
+            manifest = finish_job(self._job, code, release=False)
             self._settings.last_manifest = str(manifest)
             self._report = manifest.parent / 'sync_report.json'
             self._settings.last_report = str(self._report)
@@ -938,6 +949,10 @@ class NTEBRIDGE_OT_worker(_WorkerModal, bpy.types.Operator):
         settings = context.scene.nte_bridge
         try:
             manifest = selected_manifest(settings)
+            from .workspace import directory_lock, check_background_use
+            self._job_lock = directory_lock(manifest.parent.parent, '导出或发送任务正在使用当前缓存，请等待完成。')
+            self._job_lock.__enter__()
+            check_background_use(manifest.parent)
             engine, python = _engine_path(settings)
             self._report = manifest.parent / (self.action + '_report.json')
             command = _task_command(manifest, engine, python, self.action, self._report, settings.sync_mode)
@@ -951,12 +966,51 @@ class NTEBRIDGE_OT_worker(_WorkerModal, bpy.types.Operator):
             settings.last_report = str(self._report)
             return self._launch(context, command, manifest.parent / (self.action + '.log'))
         except Exception as error:
+            self._release_workspace()
             settings.status = str(error)
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
 
     def _complete(self, code):
         _completed_report(self._settings, self._report, code)
+
+
+class NTEBRIDGE_OT_choose_cook_folder(bpy.types.Operator):
+    bl_idname = 'nte_bridge.choose_cook_folder'
+    bl_label = '选择工程中的角色文件夹'
+    bl_description = '浏览当前 UE 工程的 Content 文件夹，自动填写 /Game 资源目录'
+    directory: StringProperty(subtype='DIR_PATH')
+    filter_folder: BoolProperty(default=True, options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return not context.scene.nte_bridge.busy
+
+    def invoke(self, context, event):
+        try:
+            settings = context.scene.nte_bridge
+            content = resolved_project(settings).parent / 'Content'
+            chosen = settings.cook_folder if settings.cook_use_custom else default_character_folder(settings)
+            candidate = content / chosen[len('/Game/'):] if chosen.startswith('/Game/') else content / 'Characters'
+            self.directory = str(candidate if candidate.is_dir() else content) + '/'
+            context.window_manager.fileselect_add(self)
+            return {'RUNNING_MODAL'}
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
+    def execute(self, context):
+        try:
+            from .blender_packaging import folder_from_directory
+            settings = context.scene.nte_bridge
+            folder = folder_from_directory(settings, self.directory)
+            settings.cook_use_custom = True
+            settings.cook_folder = folder
+            settings.status = '已选择烘焙目录：' + folder
+            return {'FINISHED'}
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
 
 
 class NTEBRIDGE_OT_cook(_WorkerModal, bpy.types.Operator):
@@ -1095,18 +1149,19 @@ class NTEBRIDGE_OT_select_cooked_assets(_WorkerModal, bpy.types.Operator):
             packager = settings.packager_source.strip() or detect_packager_source()
             if not packager or not settings.package_output.strip():
                 raise BridgeError('请选择 Mod 成品输出目录；无法自动找到打包器时请在高级设置指定。')
-            from .cooking import lock_cook_report
-            # Another Blender may be replacing this role's current directory.
-            # Never recreate it between the backend's rename operations.
+            from .cooking import lock_cook_report, selection_directory
+            # All roles share the project sandbox and its operation lock.
             with lock_cook_report(selection['cook_report']):
                 selection = selection_request(settings)
-                root = Path(settings.cook_report).parent / 'current' / 'selections' / new_id()
-                root.mkdir(parents=True, exist_ok=False)
+                root = selection_directory(settings.cook_report)
+                root.mkdir(parents=True, exist_ok=True)
                 path = root / 'selection.json'
                 self._report = root / 'package_report.json'
                 write_json(path, selection)
+                from .packaging import file_sha256
+                selection_hash = file_sha256(path)
             command = [str(worker_python()), str(Path(__file__).with_name('cli.py')), 'package-selection',
-                       '--selection', str(path), '--packager-source', bpy.path.abspath(packager),
+                       '--selection', str(path), '--selection-sha256', selection_hash, '--packager-source', bpy.path.abspath(packager),
                        '--output-dir', bpy.path.abspath(settings.package_output), '--mod-name', settings.mod_name,
                        '--report', str(self._report)]
             settings.last_report = str(self._report)
@@ -1342,7 +1397,8 @@ class NTEBRIDGE_PT_package(_NTEChildPanel, bpy.types.Panel):
         column = _panel_column(self, context)
         column.prop(settings, 'cook_use_custom')
         if settings.cook_use_custom:
-            _wide_prop(column, settings, 'cook_folder')
+            column.operator('nte_bridge.choose_cook_folder', text='选择工程中的角色文件夹…', icon='FILE_FOLDER')
+            _wrapped(column, settings.cook_folder or '尚未选择角色文件夹', context)
         else:
             _wrapped(column, default_character_folder(settings) or '读取角色后自动确定 UE 目录', context, 'FILE_FOLDER')
         column.operator('nte_bridge.cook', text='烘焙角色目录', icon='RENDER_STILL')
@@ -1411,7 +1467,7 @@ CLASSES = (NTEBridgePartEntry, NTEBridgeSourceMeshEntry, NTEBridgeMaterialEntry,
            NTEBRIDGE_OT_refresh_slots, NTEBRIDGE_OT_source_report, NTEBRIDGE_OT_edit_state,
            NTEBRIDGE_OT_edit_texture, NTEBRIDGE_OT_open_graph, NTEBRIDGE_OT_validate,
            NTEBRIDGE_OT_export, NTEBRIDGE_OT_send, NTEBRIDGE_OT_worker, NTEBRIDGE_UL_parts,
-           NTEBRIDGE_OT_cook, NTEBRIDGE_OT_select_filtered_cooked, NTEBRIDGE_UL_cooked_assets, NTEBRIDGE_OT_select_cooked_assets,
+           NTEBRIDGE_OT_choose_cook_folder, NTEBRIDGE_OT_cook, NTEBRIDGE_OT_select_filtered_cooked, NTEBRIDGE_UL_cooked_assets, NTEBRIDGE_OT_select_cooked_assets,
            NTEBRIDGE_UL_textures, NTEBRIDGE_PT_main, NTEBRIDGE_PT_materials,
            NTEBRIDGE_PT_catalog, NTEBRIDGE_PT_textures, NTEBRIDGE_PT_nodes,
            NTEBRIDGE_PT_send, NTEBRIDGE_PT_package, NTEBRIDGE_PT_advanced)

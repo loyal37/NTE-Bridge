@@ -1,4 +1,4 @@
-"""Bounded role-cache publication, crash recovery and cross-process exclusion."""
+"""Shared project sandbox, stale selection invalidation and process exclusion."""
 import json
 import os
 from pathlib import Path
@@ -42,20 +42,22 @@ class CookCacheTests(unittest.TestCase):
         self.commandlets.append(command)
         command = command if isinstance(command, str) else ' '.join(map(str, command))
         command = command.replace('"', '')
-        pending = Path(log_path).parent
-        self.assertEqual(pending.name, 'pending')
-        self.assertEqual(Path(env['TEMP']), pending / 'temp')
+        workspace = Path(log_path).parent
+        self.assertEqual(workspace, cooking.cook_cache_directory(self.cache, self.project))
+        self.assertEqual(Path(env['TEMP']), workspace / 'temp')
         Path(log_path).write_text('commandlet diagnostic', encoding='utf-8')
         if '-run=pythonscript' in command:
-            self.assertIn('-script=' + (pending / 'catalog_runner.py').as_posix(), command)
-            write_json(pending / 'catalog.json', dict(success=True, errors=[],
-                request_sha256=file_sha256(pending.parent / 'cook_request.json'),
+            self.assertIn('-script=' + (workspace / 'catalog_runner.py').as_posix(), command)
+            write_json(workspace / 'catalog.json', dict(success=True, errors=[],
+                request_sha256=file_sha256(workspace / 'cook_request.json'),
                 project_file=str(self.project), assets=[
                     dict(asset_path=self.request['character_folder'] + '/' + name,
                          asset_type='SkeletalMesh' if name == 'Keep' else 'Texture2D') for name in self.names]))
         else:
-            output = pending / 'cooked/Windows/HT/Content/Characters/Player/Nitsa'
-            output.mkdir(parents=True)
+            self.assertIn('-iterate', command)
+            self.assertIn('-OutputDir=' + str(workspace / 'cooked/[Platform]'), command)
+            output = workspace / 'cooked/Windows/HT/Content' / self.request['character_folder'][len('/Game/'):]
+            output.mkdir(parents=True, exist_ok=True)
             for name in self.names:
                 for suffix in ('.uasset', '.uexp'):
                     (output / (name + suffix)).write_bytes((name + suffix).encode())
@@ -82,12 +84,12 @@ class CookCacheTests(unittest.TestCase):
         return subprocess.run([sys.executable, '-c', script, str(ROOT / 'blender_addon'), str(root),
                                'die' if abrupt else 'normal'], capture_output=True, timeout=20)
 
-    def test_stable_compact_identity_is_read_only_and_separates_project_and_role(self):
+    def test_stable_identity_is_read_only_shared_by_roles_and_separates_projects(self):
         first = cooking.cook_cache_directory(self.cache, self.project, self.request['character_folder'])
         self.assertEqual(first, cooking.cook_cache_directory(self.cache, self.project, self.request['character_folder']))
         self.assertLessEqual(len(first.name), 29)
         self.assertNotEqual(first, cooking.cook_cache_directory(self.cache, self.root / 'Other/HT.uproject', self.request['character_folder']))
-        self.assertNotEqual(first, cooking.cook_cache_directory(self.cache, self.project, '/Game/Other/Nitsa'))
+        self.assertEqual(first, cooking.cook_cache_directory(self.cache, self.project, '/Game/Other/Nitsa'))
         self.assertFalse(self.cache.exists())
 
     def test_reservation_prevents_request_replacement_and_cancel_is_idempotent(self):
@@ -129,12 +131,12 @@ class CookCacheTests(unittest.TestCase):
         with cooking._workspace_lock(root):
             pass
 
-    def test_recook_replaces_current_removes_stale_assets_and_old_selected_staging(self):
+    def test_recook_reuses_shared_output_and_cleans_only_old_selected_staging(self):
         submission, first = self.cook()
         self.assertTrue(first['success'], first)
         old_hash = file_sha256(submission['report_path'])
         cache = Path(submission['cache_directory'])
-        staged = cache / 'current/selections/old/packaging/data.bin'
+        staged = cooking.selection_directory(submission['report_path']) / 'old/packaging/data.bin'
         staged.parent.mkdir(parents=True)
         staged.write_bytes(b'obsolete selected package staging')
         self.names = ['Keep']
@@ -145,8 +147,10 @@ class CookCacheTests(unittest.TestCase):
         self.assertEqual(first['cooked_root'], second['cooked_root'])
         self.assertNotEqual(first['cook_id'], second['cook_id'])
         self.assertFalse(staged.exists())
-        self.assertFalse(list(Path(second['cooked_root']).rglob('Gone.*')))
-        self.assertEqual([path.name for path in cache.iterdir() if path.is_dir()], ['current'])
+        # Only the native cooker decides which old packages are obsolete;
+        # the bridge must never empty or replace this shared tree.
+        self.assertTrue(list(Path(second['cooked_root']).rglob('Gone.*')))
+        self.assertEqual({path.name for path in cache.iterdir() if path.is_dir()}, {'cooked', 'temp'})
         self.assertEqual(len(list((self.cache / 'Cooks').iterdir())), 1)
         self.assertEqual(self.source.read_bytes(), b'original UE source is untouched')
         cooking.load_cook_report(second_submission['report_path'], verify_files=True)
@@ -162,7 +166,7 @@ class CookCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(BridgeError, '已过期'):
             cooking.load_cook_report(archived, verify_files=True)
 
-    def test_failed_recook_preserves_successful_current_but_current_report_is_failure(self):
+    def test_partial_failed_cook_keeps_shared_files_but_invalidates_previous_generation(self):
         submission, first = self.cook()
         archive = self.root / 'last_success.json'
         write_json(archive, first)
@@ -173,12 +177,15 @@ class CookCacheTests(unittest.TestCase):
         cache = Path(submission['cache_directory'])
         self.assertFalse((cache / 'pending').exists())
         self.assertFalse((cache / 'previous').exists())
-        self.assertEqual(cooking.load_cook_report(archive, verify_files=True)['cook_id'], first['cook_id'])
+        with self.assertRaisesRegex(BridgeError, '已过期'):
+            cooking.load_cook_report(archive)
+        self.assertTrue(list(Path(first['cooked_root']).rglob('Keep.uasset')))
+        self.assertTrue(list(Path(first['cooked_root']).rglob('Broken.uasset')))
         self.assertIn('commandlet diagnostic', Path(failed['diagnostic_log']).read_text(encoding='utf-8'))
         with self.assertRaisesRegex(BridgeError, '成功'):
             cooking.load_cook_report(submission['report_path'])
 
-    def test_report_publication_failure_rolls_back_previous_current(self):
+    def test_report_publication_failure_leaves_shared_generation_uncommitted(self):
         submission, first = self.cook()
         archive = self.root / 'last_success.json'
         write_json(archive, first)
@@ -193,31 +200,28 @@ class CookCacheTests(unittest.TestCase):
         with patch('nte_bridge.cooking.write_json', side_effect=fail_once):
             _, failure = self.cook()
         self.assertFalse(failure['success'])
-        self.assertEqual(cooking.load_cook_report(archive, verify_files=True)['files'], first['files'])
+        with self.assertRaisesRegex(BridgeError, '已过期'):
+            cooking.load_cook_report(archive)
         cache = Path(submission['cache_directory'])
         self.assertFalse((cache / 'previous').exists())
         self.assertFalse((cache / 'pending').exists())
 
-    def test_interrupted_uncommitted_publication_recovers_previous_before_next_attempt(self):
+    def test_interrupted_cook_can_retry_same_sandbox_without_extra_full_tree(self):
         submission, first = self.cook()
         root = Path(submission['cache_directory'])
-        with cooking._workspace_lock(root):
-            metadata = cooking._cache_metadata(root)
-            cooking._move_work(root, 'current', 'previous', metadata)
-            for name in ('current', 'pending'):
-                work = root / name
-                work.mkdir()
-                write_json(work / cooking._WORK_MARKER, dict(kind='NTEBridgeCookWork',
-                    cache_id=metadata['cache_id'], cook_id='interrupted', committed=False))
-                (work / 'partial').write_bytes(b'failed generation')
-            cooking._recover_work(root, metadata)
+        write_json(root / cooking._STATE, dict(cook_id='interrupted', committed=False))
+        with self.assertRaisesRegex(BridgeError, '已过期'):
+            cooking.load_cook_report(submission['report_path'])
+        _, second = self.cook()
+        self.assertTrue(second['success'], second)
+        self.assertEqual(second['cooked_root'], first['cooked_root'])
         self.assertFalse((root / 'pending').exists())
         self.assertFalse((root / 'previous').exists())
-        self.assertEqual(cooking.load_cook_report(submission['report_path'], verify_files=True)['cook_id'], first['cook_id'])
+        self.assertEqual(cooking.load_cook_report(submission['report_path'], verify_files=True)['cook_id'], second['cook_id'])
 
     def test_unknown_work_directory_is_never_removed(self):
         submission = self.prepare()
-        unknown = Path(submission['cache_directory']) / 'pending'
+        unknown = Path(submission['cache_directory']) / 'cooked'
         unknown.mkdir()
         sentinel = unknown / 'user-file'
         sentinel.write_bytes(b'do not delete')
@@ -229,7 +233,7 @@ class CookCacheTests(unittest.TestCase):
     def test_work_directory_link_cannot_escape_into_ue_content(self):
         submission = self.prepare()
         root = Path(submission['cache_directory'])
-        link = root / 'pending'
+        link = root / 'cooked'
         try:
             link.symlink_to(self.content, target_is_directory=True)
         except OSError as error:
@@ -258,19 +262,41 @@ class CookCacheTests(unittest.TestCase):
     def test_persistent_delete_failure_keeps_marker_and_retry_can_finish(self):
         submission, _ = self.cook()
         root = Path(submission['cache_directory'])
-        marker = root / 'current' / cooking._WORK_MARKER
+        directory = cooking.selection_directory(submission['report_path'])
+        marker = directory / cooking._WORK_MARKER
+        (directory / 'package.log').write_text('temporary package log', encoding='utf-8')
         metadata = cooking._cache_metadata(root)
         original_unlink = Path.unlink
         def deny_log(path, *args, **kwargs):
-            if path.name == 'catalog.log':
+            if path.name == 'package.log':
                 raise PermissionError('sharing violation')
             return original_unlink(path, *args, **kwargs)
         with patch.object(Path, 'unlink', deny_log), patch('nte_bridge.cooking.time.sleep') as sleep:
             with self.assertRaises(PermissionError):
-                cooking._remove_work(root, 'current', metadata)
+                cooking._remove_work(root, 'selections', metadata)
         self.assertEqual(sleep.call_count, 6)
         self.assertTrue(marker.is_file())
-        cooking._remove_work(root, 'current', metadata)
+        cooking._remove_work(root, 'selections', metadata)
+        self.assertFalse(directory.exists())
+        with self.assertRaisesRegex(BridgeError, '不能清空'):
+            cooking._remove_work(root, 'cooked', metadata)
+
+    def test_second_role_uses_same_tree_preserves_first_role_and_same_project_lock(self):
+        first_request, first = self.cook()
+        root = Path(first_request['cache_directory'])
+        files = {item['path']: item['sha256'] for item in first['files']}
+        self.request['character_folder'] = '/Game/Characters/Player/Other'
+        (self.project.parent / 'Content/Characters/Player/Other').mkdir()
+        with cooking.lock_cook_report(first_request['report_path']):
+            with self.assertRaisesRegex(BridgeError, '正在烘焙或打包'):
+                self.prepare()
+        second_request, second = self.cook()
+        self.assertTrue(second['success'], second)
+        self.assertEqual(first_request['cache_directory'], second_request['cache_directory'])
+        self.assertEqual(first['cooked_root'], second['cooked_root'])
+        actual = {item['path']: item['sha256'] for item in second['files']}
+        self.assertTrue(all(actual.get(path) == sha for path, sha in files.items()))
+        self.assertEqual(len(list(root.parent.iterdir())), 1)
         self.assertFalse((root / 'current').exists())
 
     def test_copied_or_external_report_locks_actual_cache_and_prevents_recook(self):

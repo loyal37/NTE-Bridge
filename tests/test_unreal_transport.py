@@ -11,7 +11,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "blender_addon"))
 from nte_bridge.core import BridgeError, write_json
 from nte_bridge.unreal_transport import (matching_nodes, validate_report, commandlet_command,
-                                         run_commandlet_job, _transport_status)
+                                         run_commandlet_job, _transport_status, _finish)
 from nte_bridge.unreal_receiver import _check_bones, run_job, _saved_asset_hashes
 from test_core import fixture
 
@@ -84,9 +84,20 @@ class TransportTests(unittest.TestCase):
             argv, report = commandlet_command(source, root / "UE")
             script = next(arg for arg in argv if arg.startswith("-script="))[8:]
             self.assertIn("NTE space ", script)
+            self.assertIn('-NODEFAULTLOG', argv)
             self.assertNotIn("\\", script)
             self.assertTrue(Path(script).is_file())
-            self.assertFalse(report.exists())
+            first = json.loads(report.read_text(encoding='utf-8'))
+            self.assertEqual(first['stage'], 'pending')
+            second_argv, second_report = commandlet_command(source, root / 'UE')
+            self.assertEqual(argv, second_argv)
+            self.assertEqual(report, second_report)
+            second = json.loads(report.read_text(encoding='utf-8'))
+            self.assertNotEqual(first['invocation_id'], second['invocation_id'])
+            with self.assertRaisesRegex(BridgeError, '过期'):
+                _finish(source, report, manifest, first['invocation_id'])
+            self.assertEqual(len(list(root.glob('ue_run*.py'))), 1)
+            self.assertEqual(len(list(root.glob('ue_invocation*.json'))), 1)
             self.assertIn("del sys.modules[_nte_name]", Path(script).read_text(encoding="utf-8"))
 
     def test_saved_asset_identity_changes_when_another_job_overwrites_it(self):

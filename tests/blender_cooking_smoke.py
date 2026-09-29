@@ -60,6 +60,21 @@ def main():
     settings.mesh_path = role + '/fire_phy/SM_Fire'
     checks += ['default-whole-role-root-from-source-or-Player-path', 'custom-model-default-parent', 'project-directory-resolves-unique-uproject']
 
+    chosen_directory = project.parent / 'Content/Characters/Player/OtherRole'
+    opened = []
+    picker = SimpleNamespace(directory='', report=lambda *args: None)
+    picker_context = SimpleNamespace(scene=bpy.context.scene,
+        window_manager=SimpleNamespace(fileselect_add=lambda operator: opened.append(operator.directory)))
+    assert blender_ui.NTEBRIDGE_OT_choose_cook_folder.invoke(picker, picker_context, None) == {'RUNNING_MODAL'}
+    assert Path(opened[0]) == project.parent / 'Content/Characters/Player/078_Nitsa'
+    assert bpy.ops.nte_bridge.choose_cook_folder(directory=str(chosen_directory)) == {'FINISHED'}
+    assert settings.cook_folder == '/Game/Characters/Player/OtherRole' and settings.cook_use_custom
+    for bad in (project.parent, project.parent / 'Content', output, chosen_directory / 'Missing'):
+        rejected(lambda: bpy.ops.nte_bridge.choose_cook_folder(directory=str(bad)), 'Content')
+        assert settings.cook_folder == '/Game/Characters/Player/OtherRole'
+    settings.cook_use_custom = False
+    checks += ['folder-picker-opens-current-project-role', 'folder-picker-maps-content-path-and-rejects-outside-project']
+
     settings.cook_use_custom = True
     settings.cook_folder = '/Game/Characters/Player/OtherRole'
     assert blender_packaging.character_folder(settings) == settings.cook_folder
@@ -112,10 +127,10 @@ def main():
         assert bpy.ops.nte_bridge.cook() == {'FINISHED'}
     _, other_command, _ = captured[-1]
     other_request = Path(other_command[other_command.index('--request') + 1])
-    assert other_request.parent != request_path.parent
+    assert other_request.parent == request_path.parent
     cancel_cook_request(other_request, other_command[other_command.index('--request-token') + 1])
     settings.cook_use_custom = False
-    checks.append('different-role-cooks-use-separate-stable-directories')
+    checks.append('different-roles-share-one-project-cook-directory')
 
     with patch.object(blender_ui._WorkerModal, '_launch', side_effect=OSError('fixture child launch failed')):
         rejected(lambda: bpy.ops.nte_bridge.cook(), 'fixture child launch failed')
@@ -207,17 +222,24 @@ def main():
     assert selection['selected_assets'] == [role + '/T_Hair']
     assert selection['export_directory'] == str(Path(settings.cook_export_directory))
     assert selection['cook_report_sha256'] == hashlib.sha256(report_path.read_bytes()).hexdigest()
-    assert selection_path.is_relative_to(report_path.parent / 'current/selections')
+    assert selection_path.is_relative_to(report_path.parent / 'selections')
     assert '--output-dir' in command and command[command.index('--output-dir') + 1] == settings.package_output
     checks += ['export-directory-and-explicit-selection-serialized', 'pack-selection-does-not-resolve-or-launch-ue']
+    assert command[command.index('--selection-sha256') + 1] == hashlib.sha256(selection_path.read_bytes()).hexdigest()
+    with patch.object(blender_ui._WorkerModal, '_launch', capture):
+        assert bpy.ops.nte_bridge.select_cooked_assets() == {'FINISHED'}
+    _, repeated_command, _ = captured[-1]
+    assert Path(repeated_command[repeated_command.index('--selection') + 1]) == selection_path
+    assert not any(path.is_dir() for path in selection_path.parent.iterdir())
+    checks.append('repeat-selection-reuses-file-and-binds-worker-to-selection-hash')
 
-    selection_directory = report_path.parent / 'current/selections'
+    selection_directory = report_path.parent / 'selections'
     before_selections = {path.name for path in selection_directory.iterdir()}
     with lock_cook_report(report_path), patch.object(blender_ui._WorkerModal, '_launch') as busy_launch:
         rejected(lambda: bpy.ops.nte_bridge.select_cooked_assets(), '正在烘焙或打包')
         busy_launch.assert_not_called()
     assert {path.name for path in selection_directory.iterdir()} == before_selections
-    checks.append('active-role-lock-rejects-selection-before-writing-or-launching')
+    checks.append('active-project-lock-rejects-selection-before-writing-or-launching')
 
     # A blocked row cannot be smuggled through programmatic property assignment.
     blocked = next(entry for entry in settings.cook_assets if not entry.packable)

@@ -78,6 +78,18 @@ def main():
     assert (manifest.parent / 'meshes/mesh.fbx').is_file()
     assert (manifest.parent / 'export.log').is_file()
     assert not (manifest.parent / '_export_copy.blend').exists()
+    first_job = json.loads(manifest.read_text(encoding='utf-8'))['job_id']
+    stale = manifest.parent / 'textures/obsolete.png'
+    stale.parent.mkdir(exist_ok=True)
+    stale.write_bytes(b'old unused texture')
+    old_report = manifest.parent / 'ue_report.json'
+    old_report.write_text('{"success":true}', encoding='utf-8')
+    again = export_job(bpy.context)
+    assert again == manifest and manifest.parent.name == 'current'
+    assert json.loads(manifest.read_text(encoding='utf-8'))['job_id'] != first_job
+    assert not stale.exists() and not old_report.exists()
+    assert [p.name for p in (cache / 'Jobs').iterdir() if p.is_dir()] == ['current']
+    checks.append('repeat-export-reuses-current-and-removes-stale-textures-and-reports')
     report = manifest.parent / 'sync_report.json'
     report.write_text('{"cache_smoke_fixture":true}', encoding='utf-8')
     settings.last_manifest, settings.last_report = str(manifest), str(report)

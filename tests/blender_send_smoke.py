@@ -30,6 +30,7 @@ def main():
     assert Path(settings.project_file).resolve() == project
     output = ROOT / 'artifacts/blender_send_smoke'
     output.mkdir(parents=True, exist_ok=True)
+    old_job_directories = {p.name for p in (output / 'Jobs').glob('*') if p.is_dir()}
     # Model the first-use workflow: JSON discovery into entirely new UE folders.
     asset_root = '/Game/NTEBridgeAuto/Case_' + uuid.uuid4().hex[:10]
     source_folder = output / ('source_' + asset_root.rsplit('/', 1)[-1])
@@ -109,6 +110,33 @@ def main():
     assert {item['asset_path'] for item in manifest['export_assets']}.isdisjoint({skeleton_path, physics_path, material_path})
     assert 'Blender 4.5.7' in (manifest_path.parent / 'export.log').read_text(encoding='utf-8')
 
+    previous_job = manifest['job_id']
+    previous_invocation = report['invocation_id']
+    stale = manifest_path.parent / 'stale-unused-texture.png'
+    stale.write_bytes(b'previous task')
+    with patch.object(blender_ui._WorkerModal, '_launch', capture):
+        assert bpy.ops.nte_bridge.send() == {'RUNNING_MODAL'}
+    operator = operators[-1]
+    deadline = time.monotonic() + 240
+    while time.monotonic() < deadline:
+        if operator._process.poll() is None:
+            time.sleep(0.1)
+            continue
+        terminal = operator.modal(bpy.context, SimpleNamespace(type='TIMER'))
+        if terminal in ({'FINISHED'}, {'CANCELLED'}):
+            break
+    else:
+        operator._process.kill()
+        raise AssertionError('Repeated send timed out')
+    assert terminal == {'FINISHED'}, settings.status
+    assert Path(settings.last_manifest) == manifest_path and not stale.exists()
+    assert json.loads(manifest_path.read_text(encoding='utf-8'))['job_id'] != previous_job
+    repeated = json.loads(Path(settings.last_report).read_text(encoding='utf-8'))
+    assert repeated['success'] and repeated['invocation_id'] != previous_invocation
+    assert len(list(manifest_path.parent.glob('ue_run*.py'))) == 1
+    assert len(list(manifest_path.parent.glob('ue_invocation*.json'))) == 1
+    assert {p.name for p in manifest_path.parent.parent.iterdir() if p.is_dir()} == old_job_directories | {'current'}
+
     # A subsequent invalid current edit must not leave the successful task selected.
     settings.mesh.modifiers.new('Unsupported current edit', 'MIRROR')
     try:
@@ -125,6 +153,7 @@ def main():
                          'failed-current-export-invalidates-previous-job',
                          'source-folder-enables-reference-placeholders',
                          'new-ue-folders-and-exact-asset-paths',
+                         'repeat-send-replaces-job-and-invocation-in-place',
                          'skeleton-material-physics-created-outside-pack-list']}
     (output / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
     print('NTE_BRIDGE_SEND_SMOKE=' + json.dumps(result), flush=True)

@@ -61,8 +61,17 @@ def default_character_folder(settings):
 def character_folder(settings):
     folder = settings.cook_folder.strip().strip('"').strip("'").rstrip('/') if settings.cook_use_custom else default_character_folder(settings)
     if not folder:
-        raise BridgeError('无法确定角色目录，请选择自定义 UE 目录并填写 /Game/... 路径。')
+        raise BridgeError('无法确定角色目录，请启用自定义 UE 烘焙目录并选择工程中的角色文件夹。')
     return package_path(folder, 'UE 烘焙目录')
+
+
+def folder_from_directory(settings, directory):
+    content = (resolved_project(settings).parent / 'Content').resolve()
+    value = str(directory).strip().strip('"').strip("'")
+    chosen = Path(bpy.path.abspath(value)).resolve() if value else None
+    if chosen is None or not chosen.is_dir() or chosen == content or not chosen.is_relative_to(content):
+        raise BridgeError('请选择当前 UE 工程 Content 内的一个角色文件夹。')
+    return package_path('/Game/' + chosen.relative_to(content).as_posix(), 'UE 烘焙目录')
 
 
 def size_label(value):

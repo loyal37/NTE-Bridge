@@ -23,6 +23,7 @@ def main(argv=None):
     sync.add_argument("--report")
     sync.add_argument("--mode", choices=("remote", "commandlet"), default="remote")
     sync.add_argument("--timeout", type=int, default=300)
+    sync.add_argument('--job-id')
     package = sub.add_parser("package")
     package.add_argument("--manifest", required=True)
     package.add_argument("--engine-dir", required=True)
@@ -35,6 +36,7 @@ def main(argv=None):
     package.add_argument("--cooked-root")
     package.add_argument("--skip-cook", action="store_true")
     package.add_argument("--timeout", type=int, default=1800)
+    package.add_argument('--job-id')
     cook = sub.add_parser('cook')
     cook.add_argument('--request', required=True)
     cook.add_argument('--engine-dir', required=True)
@@ -43,6 +45,7 @@ def main(argv=None):
     cook.add_argument('--timeout', type=int, default=1800)
     selected = sub.add_parser('package-selection')
     selected.add_argument('--selection', required=True)
+    selected.add_argument('--selection-sha256')
     selected.add_argument('--packager-source', required=True)
     selected.add_argument('--packager-tools')
     selected.add_argument('--output-dir', required=True)
@@ -66,7 +69,7 @@ def main(argv=None):
                 result = package_selection(args.selection, args.packager_source,
                     packager_tools_dir=args.packager_tools, output_dir=args.output_dir,
                     mod_name=args.mod_name, adapter_path=args.adapter_path,
-                    timeout=args.timeout, report_path=report_path)
+                    timeout=args.timeout, report_path=report_path, selection_sha256=args.selection_sha256)
         except Exception as exc:
             result.update(success=False, errors=[str(exc)], error_type=type(exc).__name__)
             if not isinstance(exc, BridgeError):
@@ -78,6 +81,8 @@ def main(argv=None):
             report_path = None
             raise BridgeError("报告路径不能覆盖输入清单")
         manifest = load_manifest(args.manifest)
+        if getattr(args, 'job_id', None) and manifest['job_id'] != args.job_id:
+            raise BridgeError('导出任务已被覆盖，请重新发送当前模型。')
         if report_path:
             from nte_bridge.core import resolve_source
             input_paths = {Path(args.manifest).resolve(), Path(manifest["project_file"]).resolve()}

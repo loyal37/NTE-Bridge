@@ -74,7 +74,8 @@ class PackagingTests(unittest.TestCase):
         self.assertFalse(any("M_Test" in f["path"] or "Skeleton" in f["path"] or "Physics" in f["path"] or "OldAsset" in f["path"] for f in first["files"]))
         (Path(first["source_dir"]) / "obsolete.uasset").write_bytes(b"old")
         second = self.stage()
-        self.assertNotEqual(first["source_dir"], second["source_dir"])
+        self.assertEqual(first["source_dir"], second["source_dir"])
+        self.assertNotEqual(first["run_id"], second["run_id"])
         self.assertFalse((Path(second["source_dir"]) / "obsolete.uasset").exists())
         for file in second["files"]:
             self.assertEqual(file["sha256"], file_sha256(Path(second["source_dir"]) / file["path"]))

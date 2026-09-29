@@ -12,8 +12,10 @@ dotnet artifacts/packager_cli/NteBridge.Packager.dll --job request.json --report
 The Python packaging module produces the request from a fresh allow-listed staging
 tree. The adapter checks the full file inventory and hashes before calling the
 existing service. Installed `NteMorphTargetPatch.exe`, `retoc.exe`, and
-`oo2core_9_win64.dll` remain in the explicitly configured `tools_dir`. Output must
-not already exist. Service cancellation kills child processes; service verification
+`oo2core_9_win64.dll` remain in the explicitly configured `tools_dir`. Adapter output must
+not already exist. The bridge supplies a reset staging/new-output directory, verifies
+the resulting trio and replaces same-name user outputs with rollback on I/O failure.
+The adapter does not write directly over the user's previous successful Mod. Service cancellation kills child processes; service verification
 and rollback behavior are retained. Final reports bind job ID, manifest hash and
 unique packaging run ID, and include the three output file hashes.
 

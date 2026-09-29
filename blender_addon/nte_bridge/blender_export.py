@@ -13,6 +13,7 @@ from mathutils import Matrix
 from .core import BridgeError, compile_graph, validate_manifest, write_json
 from .blender_cache import ensure_cache
 from .blender_textures import discover_material_previews, stage_preview_images
+from .workspace import directory_lock, owned_directory, check_background_use
 
 
 def new_id():
@@ -186,8 +187,20 @@ def prepare_job(context, settings=None):
     settings = settings or context.scene.nte_bridge
     preview_staging = []
     manifest = profile_manifest(settings, preview_staging=preview_staging)
-    job_dir = ensure_cache(settings) / manifest['job_id']
-    job_dir.mkdir(parents=True, exist_ok=False)
+    jobs = ensure_cache(settings).resolve()
+    lock = directory_lock(jobs, '导出或发送任务正在使用当前缓存，请等待完成。')
+    lock.__enter__()
+    try:
+        job_dir = jobs / 'current'
+        check_background_use(job_dir)
+        job_dir = owned_directory(job_dir, 'NTEBridgeImport', reset=True)
+        return _prepare_job_files(settings, manifest, preview_staging, job_dir, lock)
+    except Exception:
+        lock.__exit__(None, None, None)
+        raise
+
+
+def _prepare_job_files(settings, manifest, preview_staging, job_dir, lock):
     (job_dir / 'meshes').mkdir()
     blend_path = job_dir / '_export_copy.blend'
     _write_export_copy(settings, blend_path)
@@ -198,13 +211,27 @@ def prepare_job(context, settings=None):
     stage_preview_images(preview_staging, job_dir)
     write_json(job_dir / 'graph.json', graph_dict(settings.graph))
     write_json(job_dir / 'manifest.pending.json', manifest)
-    return {"job_dir": job_dir, "manifest": manifest, "blend_path": blend_path,
+    return {"job_dir": job_dir, "manifest": manifest, "blend_path": blend_path, '_lock': lock,
             "command": [bpy.app.binary_path, '--background', '--factory-startup', '--disable-autoexec',
                         '--python-exit-code', '1', '--python', str(Path(__file__).with_name('fbx_worker.py')),
                         '--', str(blend_path), str(job_dir / 'meshes' / 'mesh.fbx')]}
 
 
-def finish_job(job, returncode):
+def release_job(job):
+    lock = job.pop('_lock', None) if job else None
+    if lock:
+        lock.__exit__(None, None, None)
+
+
+def finish_job(job, returncode, *, release=True):
+    try:
+        return _finish_job(job, returncode)
+    finally:
+        if release or returncode:
+            release_job(job)
+
+
+def _finish_job(job, returncode):
     if returncode:
         raise BridgeError("FBX 导出失败，请查看任务中的 export.log。")
     manifest_path = job['job_dir'] / 'manifest.json'
@@ -219,7 +246,10 @@ def finish_job(job, returncode):
 def export_job(context, settings=None, timeout=300):
     """Synchronous entry point for tests; UI starts the same worker modally."""
     job = prepare_job(context, settings)
-    with (job['job_dir'] / 'export.log').open('w', encoding='utf-8') as log:
-        result = subprocess.run(job['command'], stdout=log, stderr=subprocess.STDOUT, timeout=timeout,
-                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-    return finish_job(job, result.returncode)
+    try:
+        with (job['job_dir'] / 'export.log').open('w', encoding='utf-8') as log:
+            result = subprocess.run(job['command'], stdout=log, stderr=subprocess.STDOUT, timeout=timeout,
+                                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        return finish_job(job, result.returncode)
+    finally:
+        release_job(job)

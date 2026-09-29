@@ -404,7 +404,7 @@ def _run(unreal, manifest, job_dir, report):
     report["success"] = True
 
 
-def run_job(manifest_path, report_path=None):
+def run_job(manifest_path, report_path=None, invocation_id=None):
     """Execute in UE's Python interpreter; always replace this invocation's report."""
     source = Path(manifest_path).resolve()
     destination = Path(report_path) if report_path else source.with_name("ue_report.json")
@@ -412,6 +412,8 @@ def run_job(manifest_path, report_path=None):
               "manifest_sha256": "", "source_sha256": {}, "assets": [], "slot_map": {}, "morph_targets": [],
               "warnings": [], "errors": [], "features_applied": False, "partial_changes": False,
               "mutation_started": False}
+    if invocation_id:
+        report['invocation_id'] = invocation_id
     try:
         report["manifest_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
         manifest = load_manifest(source)

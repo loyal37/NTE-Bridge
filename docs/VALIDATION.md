@@ -1,4 +1,16 @@
-# v0.3.1 验证记录
+# v0.3.2 验证记录
+
+日期：2026-09-29。指定 Blender 4.5.7 LTS、实际 UE 5.6.1 与现有外部打包器。
+
+- 109 项纯 Python 检查：工程共用缓存、增量烘焙参数、部分失败报告失效、锁/预约、所有权清理、固定 UE 调用报告及身份、同名成品连续覆盖、校验/替换失败恢复、部分旧成品及占用冲突。
+- Blender 4.5.7：28 项烘焙/资产窗口检查（含真实目录选择操作与 Content 路径转换）、11 项缓存检查（含连续两次实际 FBX 导出）、12 项后台发送检查（含连续两次实际 UE 导入）。固定位置复用，旧贴图/报告清除，任务身份更新，材质槽与形态键保留。
+- 实际 UE 交替烘焙角色 A → B → A，10 项检查通过。三个操作共用请求、报告和 cooked 路径；A 的网格在烘焙 B 时字节与修改时间不变，返回 A 后 B 仍在同一树中。实际日志显示增量保留 446 个包、重烘焙 0、删除 0。新烘焙清理旧选择暂存，无完整 cooked 备份，源资产与工程描述不变。使用 `-NODEFAULTLOG` 和 stdout 捕获后，只更新固定日志，不再生成 UE 的日期备份日志。
+- 实际外部打包两次使用同一个输出目录和 Mod 名称：第一次选网格，第二次改选两张贴图；三个路径相同，成品内容更新。retoc 回读第二次容器恰好两张新选择的贴图，无旧网格混入；固定暂存目录复用。随后模拟适配器失败，旧三文件完整保留。打包不改变 cooked 文件指纹，共 6 项检查。
+- 用户 HT 缓存检查时 Cooks 与 Jobs 均已为空，因此没有迁移、复制或删除旧烘焙/导入数据。未修改用户原模型、贴图、UE 资产或项目描述。
+
+本地证据：`artifacts/unit-v0.3.2.log`、`artifacts/cooking_ui_smoke/03beb2ecc0/result.json`、`artifacts/cache_smoke/0eb9906a0c/result.json`、`artifacts/blender_send_smoke/result.json`、`artifacts/shared_cook_smoke/4263451afd/result.json`、`artifacts/repackage032/result.json`。实际目录选择器截图及结果在 `artifacts/ui_032`。只提交 main，不创建标签或 Release。游戏内验证、完整 live-editor 传输验证仍未完成；cook 中途失败不承诺整份文件回滚。
+
+## v0.3.1 验证记录（历史缓存方案已由 v0.3.2 替代）
 
 日期：2026-09-29。使用指定的 Blender 4.5.7 LTS 与隔离 UE 5.6.1 工程。
 

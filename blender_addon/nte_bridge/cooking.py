@@ -1,4 +1,4 @@
-"""Independent character-folder cooking and immutable, selectable cooked snapshots."""
+"""Shared project cooking with UE's iterative sandbox and verified asset selections."""
 import json
 from datetime import datetime, timezone
 from contextlib import contextmanager
@@ -25,25 +25,24 @@ FORBIDDEN_CLASSES = {'Material', 'Skeleton', 'PhysicsAsset'}
 _CACHE_MARKER = '.nte_bridge_cook_cache.json'
 _WORK_MARKER = '.nte_bridge_cook_work.json'
 _RESERVATION = '.cook_reservation.json'
+_STATE = '.cook_state.json'
 
 
-def _cache_identity(project_file, character_folder):
+def _cache_identity(project_file):
     project = Path(project_file).resolve()
-    folder = package_path(character_folder, '角色烘焙文件夹')
-    identity = os.path.normcase(str(project)) + '\n' + folder.casefold()
-    return hashlib.sha256(identity.encode('utf-8')).hexdigest()
+    return hashlib.sha256(os.path.normcase(str(project)).encode('utf-8')).hexdigest()
 
 
-def cook_cache_directory(cache_root, project_file, character_folder):
-    """Stable, read-only cache placement for one full project path and role scope."""
+def cook_cache_directory(cache_root, project_file, character_folder=None):
+    """One sandbox per project; character scope never changes its placement."""
     root = Path(cache_root)
     project = Path(project_file)
     if not root.is_absolute() or not project.is_absolute():
         raise BridgeError('缓存与 UE 工程需要绝对路径。')
-    identity = _cache_identity(project, character_folder)
-    # UE still applies MAX_PATH to some engine dependencies. Keep the role
-    # label short; project identity is already included in the hash.
-    name = re.sub('[^A-Za-z0-9_-]', '_', character_folder.rsplit('/', 1)[-1])[:12]
+    if character_folder is not None:
+        package_path(character_folder, '角色烘焙文件夹')
+    identity = _cache_identity(project)
+    name = re.sub('[^A-Za-z0-9_-]', '_', project.stem)[:12]
     return root.resolve() / 'Cooks' / (name + '_' + identity[:16])
 
 
@@ -70,7 +69,7 @@ def _workspace_lock(directory):
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             locked = True
         except OSError as error:
-            raise BridgeError('同一角色正在烘焙或打包，请等待当前操作完成。') from error
+            raise BridgeError('同一工程正在烘焙或打包，请等待当前操作完成。') from error
         yield root
     finally:
         if locked:
@@ -87,24 +86,27 @@ def _workspace_lock(directory):
 def _cache_metadata(root, request=None):
     marker = root / _CACHE_MARKER
     if not marker.is_file():
-        if request is None or any((root / name).exists() for name in ('pending', 'current', 'previous')):
+        if request is None or any((root / name).exists() for name in ('cooked', 'selections', 'temp', 'pending', 'current', 'previous')):
             raise BridgeError('缓存缺少桥接所有权标记，不会清理已有目录。')
-        metadata = {'kind': 'NTEBridgeCookCache', 'schema_version': 1, 'directory': str(root),
-                    'cache_id': _cache_identity(request['project_file'], request['character_folder']),
-                    'project_file': request['project_file'], 'character_folder': request['character_folder']}
+        metadata = {'kind': 'NTEBridgeCookCache', 'schema_version': 2, 'directory': str(root),
+                    'cache_id': _cache_identity(request['project_file']),
+                    'project_file': request['project_file'], 'layout': 'project'}
         write_json(marker, metadata)
     else:
         metadata = json.loads(marker.read_text(encoding='utf-8'))
-    if metadata.get('kind') != 'NTEBridgeCookCache' or metadata.get('schema_version') != 1 \
+    if metadata.get('kind') != 'NTEBridgeCookCache' or metadata.get('schema_version') not in {1, 2} \
             or os.path.normcase(metadata.get('directory', '')) != os.path.normcase(str(root)) or not metadata.get('cache_id'):
         raise BridgeError('烘焙缓存所有权标记不匹配，不会改动其中的文件。')
-    if request is not None and metadata['cache_id'] != _cache_identity(request['project_file'], request['character_folder']):
-        raise BridgeError('这个缓存目录属于另一工程或角色，请使用该角色的独立缓存目录。')
+    if request is not None and (metadata['schema_version'] != 2
+            or metadata['cache_id'] != _cache_identity(request['project_file'])):
+        raise BridgeError('这个缓存目录不是当前工程的共用缓存，请重新点击烘焙。')
     return metadata
 
 
 def _work_path(root, name, metadata, must_exist=False):
-    if name not in {'pending', 'current', 'previous'}:
+    """Check the direct work directory, including read-only legacy reports."""
+    allowed = {'current', 'pending', 'previous'} if metadata['schema_version'] == 1 else {'cooked', 'temp', 'selections'}
+    if name not in allowed:
         raise BridgeError('无效的桥接工作目录。')
     path = root / name
     resolved = path.resolve()
@@ -123,7 +125,30 @@ def _work_path(root, name, metadata, must_exist=False):
     return path
 
 
+def _managed_directory(root, name, metadata):
+    path = _work_path(root, name, metadata)
+    if not path.exists():
+        path.mkdir()
+        write_json(path / _WORK_MARKER, {'kind': 'NTEBridgeCookWork', 'cache_id': metadata['cache_id']})
+    return path
+
+
+def selection_directory(report_path):
+    """Called while the caller holds lock_cook_report."""
+    path = Path(report_path).resolve()
+    report = json.loads(path.read_text(encoding='utf-8-sig'))
+    root = Path(report.get('cache_directory', path.parent)).resolve()
+    metadata = _cache_metadata(root)
+    if metadata['schema_version'] == 1:
+        return _work_path(root, 'current', metadata, must_exist=True) / 'selections'
+    return _managed_directory(root, 'selections', metadata)
+
+
 def _remove_work(root, name, metadata):
+    # The UE sandbox is never removed or mirrored by the bridge. UE -iterate
+    # decides which packages need rewriting or deletion.
+    if metadata['schema_version'] != 2 or name not in {'selections', 'temp'}:
+        raise BridgeError('只能清理桥接的选择暂存和临时目录，不能清空工程烘焙输出。')
     path = _work_path(root, name, metadata)
     if path.exists():
         # Only this verified direct child is recursive. Never a caller path,
@@ -165,27 +190,6 @@ def _retry_remove(function, path, exc_info):
         raise exc_info[1]
 
 
-def _move_work(root, source, target, metadata):
-    path = _work_path(root, source, metadata, must_exist=True)
-    destination = _work_path(root, target, metadata)
-    if destination.exists():
-        raise BridgeError('发布缓存的目标目录已存在：' + str(destination))
-    _retry_io(lambda: path.replace(destination))
-
-
-def _recover_work(root, metadata):
-    current = _work_path(root, 'current', metadata)
-    previous = _work_path(root, 'previous', metadata)
-    if previous.exists():
-        committed = current.exists() and json.loads((current / _WORK_MARKER).read_text(encoding='utf-8')).get('committed') is True
-        if committed:
-            _remove_work(root, 'previous', metadata)
-        else:
-            _remove_work(root, 'current', metadata)
-            _move_work(root, 'previous', 'current', metadata)
-    _remove_work(root, 'pending', metadata)
-
-
 def _reservation(root):
     path = root / _RESERVATION
     return json.loads(path.read_text(encoding='utf-8')) if path.is_file() else None
@@ -194,7 +198,7 @@ def _reservation(root):
 def _reject_reservation(root):
     reservation = _reservation(root)
     if reservation and reservation.get('expires_at', 0) > time.time():
-        raise BridgeError('同一角色已有等待启动的烘焙任务，请稍后再试。')
+        raise BridgeError('同一工程已有等待启动的烘焙任务，请稍后再试。')
     if reservation:
         (root / _RESERVATION).unlink()
 
@@ -233,7 +237,7 @@ def cancel_cook_request(request_path, request_token):
 
 @contextmanager
 def lock_cook_report(report_path):
-    """Serialize selected packaging with recooking; legacy snapshots need no lock."""
+    """Serialize all characters' cooking/packaging against the project sandbox."""
     report_path = Path(report_path).resolve()
     data = json.loads(report_path.read_text(encoding='utf-8-sig')) if report_path.is_file() else {}
     declared = data.get('cache_directory')
@@ -242,7 +246,7 @@ def lock_cook_report(report_path):
     root = Path(declared).resolve() if declared else report_path.parent
     if not (root / _CACHE_MARKER).is_file():
         if declared:
-            raise BridgeError('烘焙报告对应的角色缓存所有权标记不存在。')
+            raise BridgeError('烘焙报告对应的工程缓存所有权标记不存在。')
         yield
         return
     with _workspace_lock(root):
@@ -366,11 +370,16 @@ def load_cook_report(path, expected_sha256=None, verify_files=False):
     if data.get('cache_directory'):
         cache = Path(data['cache_directory']).resolve()
         metadata = _cache_metadata(cache)
-        current = _work_path(cache, 'current', metadata, must_exist=True)
-        marker = json.loads((current / _WORK_MARKER).read_text(encoding='utf-8'))
+        if metadata['schema_version'] == 1:
+            output = _work_path(cache, 'current', metadata, must_exist=True)
+            marker = json.loads((output / _WORK_MARKER).read_text(encoding='utf-8'))
+        else:
+            output = _work_path(cache, 'cooked', metadata, must_exist=True)
+            state_path = cache / _STATE
+            marker = json.loads(state_path.read_text(encoding='utf-8')) if state_path.is_file() else {}
         if marker.get('cook_id') != data['cook_id'] or marker.get('committed') is not True \
-                or not root.resolve().is_relative_to(current):
-            raise BridgeError('角色已经重新烘焙，这份选择报告已过期。')
+                or not root.resolve().is_relative_to(output):
+            raise BridgeError('工程已经重新烘焙或上次未完成，这份选择报告已过期。')
     files = data.get('files')
     if not isinstance(files, list) or not files:
         raise BridgeError('烘焙文件快照为空。')
@@ -436,13 +445,12 @@ def _editor(engine_dir):
     return editor
 
 
-def _cook_pending(request_path, request, engine_dir, run_root, result, timeout):
+def _cook_shared(request_path, request, editor, run_root, metadata, result, timeout):
     cook_id = result['cook_id']
     try:
         from .unreal_transport import _project_editor_running, REQUIRED_COMMANDLET_PLUGINS
         if _project_editor_running(request['project_file']):
             raise BridgeError('目标 UE 工程仍在打开；请保存并关闭该工程后再后台烘焙。')
-        editor = _editor(engine_dir)
         result['run_dir'] = str(run_root)
         catalog_path, runner = run_root / 'catalog.json', run_root / 'catalog_runner.py'
         module_root = str(Path(__file__).resolve().parent.parent)
@@ -450,12 +458,12 @@ def _cook_pending(request_path, request, engine_dir, run_root, result, timeout):
                           (module_root, str(request_path), str(catalog_path)), encoding='utf-8')
         result['phase'] = 'catalog'
         environment = dict(os.environ)
-        temporary = run_root / 'temp'
-        temporary.mkdir()
+        temporary = _managed_directory(run_root, 'temp', metadata)
         environment.update({key: str(temporary) for key in ('TEMP', 'TMP', 'TMPDIR')})
         _run(_unreal_command_line([editor, request['project_file'], '-run=pythonscript',
               '-EnablePlugins=' + ','.join(REQUIRED_COMMANDLET_PLUGINS), '-script=' + runner.as_posix(),
-              '-unattended', '-nop4', '-nosplash', '-nullrhi']), run_root / 'catalog.log', timeout, env=environment)
+              '-unattended', '-nop4', '-nosplash', '-nullrhi', '-NODEFAULTLOG', '-stdout',
+              '-FullStdOutLogOutput']), run_root / 'catalog.log', timeout, env=environment)
         if not catalog_path.is_file():
             raise BridgeError('UE 未生成资产目录报告，请查看 catalog.log。')
         catalog = json.loads(catalog_path.read_text(encoding='utf-8-sig'))
@@ -465,13 +473,13 @@ def _cook_pending(request_path, request, engine_dir, run_root, result, timeout):
         if _project_editor_running(request['project_file']):
             raise BridgeError('目标 UE 工程在扫描后被打开，请关闭后重新烘焙。')
         result['phase'] = 'cook'
-        output = run_root / 'cooked'
-        output.mkdir()
+        output = _managed_directory(run_root, 'cooked', metadata)
+        _inside(output, 'Windows')  # Reject an externally redirected platform root before UE writes.
         directory = _inside(Path(request['project_file']).parent / 'Content', request['character_folder'][len('/Game/'):])
         _run(_unreal_command_line([editor, request['project_file'], '-run=Cook', '-TargetPlatform=Windows',
-              '-SkipZenStore', '-unattended', '-nop4', '-UTF8Output', '-CookDir=' + str(directory),
-              '-OutputDir=' + str(output / '[Platform]'), '-abslog=' + str(run_root / 'cook-engine.log')]),
-             run_root / 'cook.log', timeout, env=environment)
+              '-SkipZenStore', '-iterate', '-unattended', '-nop4', '-UTF8Output', '-CookDir=' + str(directory),
+              '-OutputDir=' + str(output / '[Platform]'), '-NODEFAULTLOG', '-stdout', '-FullStdOutLogOutput']),
+             run_root / 'cook-commandlet.log', timeout, env=environment)
         cooked_root = next((candidate for candidate in (output / 'Windows', output)
                             if (candidate / Path(request['project_file']).stem / 'Content').is_dir()), None)
         if cooked_root is None:
@@ -486,60 +494,16 @@ def _cook_pending(request_path, request, engine_dir, run_root, result, timeout):
     return result
 
 
-def _publish_pending(root, metadata, result, report_path):
-    pending = _work_path(root, 'pending', metadata, must_exist=True)
-    current = _work_path(root, 'current', metadata)
-    final = dict(result, cache_directory=str(root), run_dir=str(current),
-                 cooked_root=str(current / Path(result['cooked_root']).relative_to(pending)),
-                 catalog_report=str(current / 'catalog.json'))
-    write_json(pending / 'cook_snapshot.json', final)
-    if current.exists():
-        _move_work(root, 'current', 'previous', metadata)
-    try:
-        _move_work(root, 'pending', 'current', metadata)
-        write_json(report_path, final)
-        marker_path = current / _WORK_MARKER
-        marker = json.loads(marker_path.read_text(encoding='utf-8'))
-        marker['committed'] = True
-        write_json(marker_path, marker)
-    except Exception:
-        _remove_work(root, 'current', metadata)
-        if (root / 'previous').exists():
-            _move_work(root, 'previous', 'current', metadata)
-        raise
-    try:
-        _remove_work(root, 'previous', metadata)
-    except OSError as error:
-        final.setdefault('warnings', []).append('旧缓存暂时无法清理，将在下次烘焙前重试：' + str(error))
-        write_json(report_path, final)
-    return final
-
-
-def _failure_log(root):
-    chunks = []
-    for name in ('catalog.log', 'cook.log', 'cook-engine.log'):
-        source = root / 'pending' / name
-        if source.is_file():
-            with source.open('rb') as stream:
-                stream.seek(max(0, source.stat().st_size - 65536))
-                chunks.append('=== ' + name + ' (tail) ===\n' + stream.read().decode('utf-8', errors='replace'))
-    if chunks:
-        path = root / 'last_failure.log'
-        path.write_text('\n'.join(chunks), encoding='utf-8')
-        return str(path)
-    return ''
-
-
 def cook_character(request_path, engine_dir, report_path=None, timeout=1800, request_token=None):
-    """Replace one role's current snapshot only after a complete successful cook."""
+    """Incrementally cook into the project's one shared UE sandbox in place."""
     request_path = Path(request_path).resolve()
     root = request_path.parent
     report_path = Path(report_path or root / 'cook_report.json').resolve()
     with _workspace_lock(root):
         raw = json.loads(request_path.read_text(encoding='utf-8-sig'))
         if report_path in (request_path, Path(raw.get('project_file', '')).resolve()) \
-                or any(report_path.is_relative_to(root / name) for name in ('pending', 'current', 'previous')):
-            raise BridgeError('烘焙报告不能覆盖请求、UE 工程或可替换的工作目录。')
+                or any(report_path.is_relative_to(root / name) for name in ('cooked', 'selections', 'temp', 'pending', 'current', 'previous')):
+            raise BridgeError('烘焙报告不能覆盖请求、UE 工程或工作目录。')
         request_hash = file_sha256(request_path)
         reservation = _reservation(root)
         if request_token:
@@ -552,31 +516,34 @@ def cook_character(request_path, engine_dir, report_path=None, timeout=1800, req
         result = {'schema_version': 1, 'success': False, 'phase': 'validation', 'job_id': cook_id,
                   'cook_id': cook_id, 'errors': [], 'assets': [], 'manifest_sha256': request_hash,
                   'cache_directory': str(root)}
-        metadata = None
         try:
             request = validate_cook_request(raw)
             metadata = _cache_metadata(root, request)
-            _recover_work(root, metadata)
+            # Validate before invalidating or touching a usable prior sandbox.
+            editor = _editor(engine_dir)
+            from .unreal_transport import _project_editor_running
+            if _project_editor_running(request['project_file']):
+                raise BridgeError('目标 UE 工程仍在打开；请保存并关闭该工程后再后台烘焙。')
+            for name in ('cooked', 'temp', 'selections'):
+                _work_path(root, name, metadata)
+            # UE writes in place. Mark the old generation invalid before the
+            # first process, so a partial failure can never be packaged as success.
+            write_json(root / _STATE, {'cook_id': cook_id, 'committed': False})
+            for name in ('selections', 'temp'):
+                _remove_work(root, name, metadata)
             result.update(project_file=request['project_file'], character_folder=request['character_folder'])
             write_json(report_path, result)
-            pending = _work_path(root, 'pending', metadata)
-            pending.mkdir()
-            write_json(pending / _WORK_MARKER, {'kind': 'NTEBridgeCookWork', 'cache_id': metadata['cache_id'],
-                                               'cook_id': cook_id, 'committed': False})
-            result = _cook_pending(request_path, request, engine_dir, pending, result, timeout)
+            result = _cook_shared(request_path, request, editor, root, metadata, result, timeout)
+            result['cache_directory'] = str(root)
             if result.get('success'):
-                result = _publish_pending(root, metadata, result, report_path)
+                write_json(report_path, result)
+                write_json(root / _STATE, {'cook_id': cook_id, 'committed': True})
                 return result
         except Exception as error:
             result.update(success=False, assets=[])
             result.setdefault('errors', []).append(str(error))
-        if metadata is not None:
-            log = _failure_log(root)
-            if log:
-                result['diagnostic_log'] = log
-            try:
-                _remove_work(root, 'pending', metadata)
-            except (BridgeError, OSError) as error:
-                result.setdefault('warnings', []).append('临时缓存未清理：' + str(error))
+        if result.get('phase') in {'catalog', 'cook'}:
+            name = 'catalog.log' if result['phase'] == 'catalog' else 'cook-commandlet.log'
+            result['diagnostic_log'] = str(root / name)
         write_json(report_path, result)
         return result

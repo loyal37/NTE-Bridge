@@ -6,6 +6,7 @@ those are deliberately never copied unless they appear in export_assets.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import tempfile
 import uuid
 
 from .core import BridgeError, load_manifest, resolve_source, write_json
+from .workspace import owned_directory
 
 SIDECARS = (".uasset", ".uexp", ".ubulk", ".uptnl")
 PACKABLE_TYPES = {"SkeletalMesh", "Texture2D"}
@@ -127,7 +129,7 @@ def stage_assets(manifest_path, ue_report_path, cooked_root, staging_parent=None
     if parent.is_relative_to(cooked_root):
         raise BridgeError("Staging directory cannot be inside the cooked source.")
     parent.mkdir(parents=True, exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(prefix="package-", dir=parent))
+    run_dir = owned_directory(parent / 'stage', 'NTEBridgePackageStage', reset=True)
     source_dir = run_dir / "staging"
     source_dir.mkdir()
     inventory = []
@@ -223,7 +225,7 @@ def cook_assets(manifest, engine_dir, output_dir, timeout=1800):
     if any(Path(directory) == project.parent / "Content" for directory in directories):
         raise BridgeError("Assets directly under /Game would require cooking the entire Content folder; move them into a character folder.")
     command = [editor, project, "-run=Cook", "-TargetPlatform=Windows", "-SkipZenStore", "-unattended", "-nop4",
-               "-UTF8Output", "-OutputDir=" + str(output / "[Platform]"), "-abslog=" + str(output.parent / "cook-engine.log")]
+               "-UTF8Output", "-OutputDir=" + str(output / "[Platform]"), "-NODEFAULTLOG", "-stdout", "-FullStdOutLogOutput"]
     command.extend("-CookDir=" + directory for directory in directories)
     _run(_unreal_command_line(command), output.parent / "cook.log", timeout)
     # Keep UE's [Platform] token: its asynchronous delete workspace uses _Del
@@ -256,7 +258,7 @@ def package_job(manifest_path, ue_report_path, engine_dir=None, packager_source_
             raise BridgeError("Configure the installed packager tools directory.")
         parent = manifest_path.parent / "packaging"
         parent.mkdir(exist_ok=True)
-        run_root = Path(tempfile.mkdtemp(prefix="run-", dir=parent))
+        run_root = owned_directory(parent / 'current', 'NTEBridgeLegacyPackage', reset=True)
         result["run_dir"] = str(run_root)
         if run_cook:
             result["phase"] = "cook"
@@ -268,44 +270,10 @@ def package_job(manifest_path, ue_report_path, engine_dir=None, packager_source_
         result["phase"] = "staging"
         staging = stage_assets(manifest_path, ue_report_path, cooked_root, run_root)
         result["staging_report"] = str(Path(staging["run_dir"]) / "staging_report.json")
-        result["phase"] = "adapter"
-        bundled = Path(__file__).parent / "vendor/packager_cli/NteBridge.Packager.dll"
-        adapter = Path(adapter_path) if adapter_path else bundled
-        if not adapter.is_file():
-            if not packager_source_dir:
-                raise BridgeError("A compiled adapter or the external packager source directory is required.")
-            adapter = build_adapter(packager_source_dir)
-        destination = Path(output_dir).resolve() if output_dir else run_root / "output"
-        if destination.is_relative_to(Path(staging["source_dir"])):
-            raise BridgeError("Package output cannot be inside staging.")
-        if any((destination / (name + ext)).exists() for ext in (".pak", ".utoc", ".ucas")):
-            raise BridgeError("Output already exists; choose an empty output directory or a new mod name.")
-        request = dict(staging, output_dir=str(destination), mod_name=name, tools_dir=str(Path(packager_tools_dir).resolve()))
-        request_path = run_root / "packager_request.json"
-        adapter_report_path = run_root / "packager_report.json"
-        write_json(request_path, request)
         result["phase"] = "packager"
-        command = ["dotnet", adapter] if adapter.suffix.lower() == ".dll" else [adapter]
-        # The external BuildService uses Path.GetTempPath() for another full
-        # staging copy. Keep that child process's workspace beside this job.
-        temporary_root = run_root / "temp"
-        temporary_root.mkdir()
-        adapter_environment = dict(os.environ)
-        adapter_environment.update({key: str(temporary_root) for key in ("TEMP", "TMP", "TMPDIR")})
-        _run(command + ["--job", request_path, "--report", adapter_report_path],
-             run_root / "packager.log", timeout, env=adapter_environment)
-        reply = json.loads(adapter_report_path.read_text(encoding="utf-8-sig"))
-        if reply.get("success") is not True or any(reply.get(key) != request[key] for key in ("job_id", "manifest_sha256", "run_id")):
-            raise BridgeError("Packager returned a failed or stale report.")
-        outputs = reply.get("outputs", [])
-        expected = {str((destination / (name + ext)).resolve()) for ext in (".pak", ".utoc", ".ucas")}
-        if len(outputs) != 3 or {str(Path(item["path"]).resolve()) for item in outputs} != expected:
-            raise BridgeError("Packager did not report exactly the expected three output files.")
-        for item in outputs:
-            output = Path(item["path"])
-            if not output.is_file() or output.stat().st_size <= 0 or output.stat().st_size != item["bytes"] or file_sha256(output) != item["sha256"].lower():
-                raise BridgeError("Packager output verification failed: " + str(output))
-        result.update(success=True, phase="complete", outputs=outputs, packager_report=str(adapter_report_path))
+        outputs, adapter_report = _package_staging(dict(staging, run_dir=str(run_root)), packager_source_dir,
+            packager_tools_dir, output_dir, name, adapter_path, timeout)
+        result.update(success=True, phase="complete", outputs=outputs, packager_report=adapter_report)
     except Exception as error:
         result["errors"].append(str(error))
     write_json(report_path, result)
@@ -352,7 +320,7 @@ def stage_selection(selection_path, staging_parent=None):
     if parent.is_relative_to(cooked):
         raise BridgeError('打包暂存目录不能放在烘焙快照中。')
     parent.mkdir(parents=True, exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(prefix='selection-', dir=parent))
+    run_dir = owned_directory(parent / 'stage', 'NTEBridgePackageStage', reset=True)
     source_dir = run_dir / 'staging'
     source_dir.mkdir()
     for item in files:
@@ -462,13 +430,110 @@ def _selection_package_preflight(staging, packager_source_dir, packager_tools_di
     if not adapter.is_file() and (adapter_path or not packager_source_dir or not
             (Path(packager_source_dir) / 'src/NteModPackager/Services/BuildService.cs').is_file()):
         raise BridgeError('缺少可用的外部打包器适配器或适配器构建源码。')
-    destination = Path(output_dir).resolve() if output_dir else Path(staging['run_dir']) / 'output'
+    destination = _output_directory(staging, output_dir)
     if destination.is_relative_to(Path(staging['source_dir'])) or destination.is_relative_to(Path(staging['cooked_root'])):
         raise BridgeError('Mod 输出目录不能放在烘焙快照或打包暂存文件夹内。')
     if destination.exists() and not destination.is_dir():
         raise BridgeError('Mod 输出目录指向了文件。')
-    if any((destination / (name + extension)).exists() for extension in ('.pak', '.utoc', '.ucas')):
-        raise BridgeError('同名 Mod 输出已存在，请换一个名称或输出目录。')
+    _output_targets(destination, name)
+
+
+def _output_directory(staging, output_dir):
+    # Optional Python API output must survive scratch resets just like the
+    # explicit directory required by the Blender UI.
+    return (Path(output_dir).resolve() if output_dir else
+            Path(staging['project_file']).resolve().parent / 'Saved/NTEBridgeMods')
+
+
+def _output_targets(destination, name):
+    targets = [destination / (name + extension) for extension in ('.pak', '.utoc', '.ucas')]
+    for target in targets:
+        if target.resolve().parent != destination or target.is_symlink() \
+                or (target.exists() and not target.is_file()):
+            raise BridgeError('Mod 成品路径不是普通文件：' + str(target))
+    return targets
+
+
+@contextmanager
+def _output_lock(destination, name):
+    """Different projects may publish the same mod; serialize that final set."""
+    destination.mkdir(parents=True, exist_ok=True)
+    lock = destination / ('.NTEBridge-' + name + '.lock')
+    with lock.open('a+b') as stream:
+        locked = False
+        try:
+            try:
+                if os.fstat(stream.fileno()).st_size == 0:
+                    stream.write(b'0')
+                    stream.flush()
+                stream.seek(0)
+                if os.name == 'nt':
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError as error:
+                raise BridgeError('这个 Mod 的成品正在被另一打包任务更新，请稍后重试。') from error
+            yield
+        finally:
+            if locked:
+                stream.seek(0)
+                if os.name == 'nt':
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _publish_outputs(outputs, destination, name):
+    """Publish a verified three-file set, restoring the old set on I/O failure."""
+    with _output_lock(destination, name):
+        targets = _output_targets(destination, name)
+        workspace = Path(tempfile.mkdtemp(prefix='.NTEBridge-' + name + '-', dir=destination)).resolve()
+        if workspace.parent != destination:
+            raise BridgeError('Mod 替换临时目录越界。')
+        incoming, backups, installed = {}, {}, []
+        try:
+            for target in targets:
+                # Adapter order is not significant; match by the final filename.
+                item = next(entry for entry in outputs if Path(entry['path']).name == target.name)
+                new = workspace / (target.name + '.new')
+                incoming[target] = new
+                shutil.move(item['path'], new)
+                if new.stat().st_size != item['bytes'] or file_sha256(new) != item['sha256'].lower():
+                    raise BridgeError('复制 Mod 成品时文件校验失败：' + target.name)
+            # All three new files are verified before moving any old file.
+            for target in targets:
+                if target.exists():
+                    backup = workspace / (target.name + '.old')
+                    os.replace(target, backup)
+                    backups[target] = backup
+            for target in targets:
+                os.replace(incoming[target], target)
+                installed.append(target)
+        except Exception as error:
+            recovery_errors = []
+            for target in reversed(targets):
+                try:
+                    if target in backups:
+                        os.replace(backups[target], target)
+                    elif target in installed:
+                        target.unlink()
+                except OSError as recovery:
+                    recovery_errors.append(str(recovery))
+            if recovery_errors:
+                raise BridgeError('成品替换失败，旧文件保留在 ' + str(workspace) + '：' + '; '.join(recovery_errors)) from error
+            raise
+        finally:
+            # Only known files are cleaned. Keep any unrestored old file intact.
+            for new in incoming.values():
+                new.unlink(missing_ok=True)
+            if all(not backup.exists() for backup in backups.values()) or len(installed) == len(targets):
+                for backup in backups.values():
+                    backup.unlink(missing_ok=True)
+                workspace.rmdir()
+        return [dict(item, path=str(destination / Path(item['path']).name)) for item in outputs]
 
 
 def _package_staging(staging, packager_source_dir, packager_tools_dir, output_dir,
@@ -486,12 +551,12 @@ def _package_staging(staging, packager_source_dir, packager_tools_dir, output_di
         if not packager_source_dir:
             raise BridgeError('缺少外部打包器适配器。')
         adapter = build_adapter(packager_source_dir)
-    destination = Path(output_dir).resolve() if output_dir else run_root / 'output'
+    destination = _output_directory(staging, output_dir)
     if destination.is_relative_to(Path(staging['source_dir'])):
         raise BridgeError('Mod 输出目录不能在打包暂存文件夹内。')
-    if any((destination / (name + extension)).exists() for extension in ('.pak', '.utoc', '.ucas')):
-        raise BridgeError('同名 Mod 输出已存在，请换一个名称或输出目录。')
-    request = dict(staging, output_dir=str(destination), mod_name=name, tools_dir=str(Path(tools_dir).resolve()))
+    _output_targets(destination, name)
+    build_output = run_root / 'new-output'
+    request = dict(staging, output_dir=str(build_output), mod_name=name, tools_dir=str(Path(tools_dir).resolve()))
     request_path, reply_path = run_root / 'packager_request.json', run_root / 'packager_report.json'
     write_json(request_path, request)
     temporary_root = run_root / 'temp'
@@ -505,22 +570,28 @@ def _package_staging(staging, packager_source_dir, packager_tools_dir, output_di
                                              for key in ('job_id', 'manifest_sha256', 'run_id')):
         raise BridgeError('外部打包器返回了失败或过期的报告。')
     outputs = reply.get('outputs', [])
-    expected = {str((destination / (name + extension)).resolve()) for extension in ('.pak', '.utoc', '.ucas')}
+    expected = {str((build_output / (name + extension)).resolve()) for extension in ('.pak', '.utoc', '.ucas')}
     if len(outputs) != 3 or {str(Path(item['path']).resolve()) for item in outputs} != expected:
         raise BridgeError('外部打包器没有生成预期的三个 Mod 文件。')
     for item in outputs:
         path = Path(item['path'])
         if not path.is_file() or item['bytes'] <= 0 or path.stat().st_size != item['bytes'] or file_sha256(path) != item['sha256'].lower():
             raise BridgeError('打包输出文件指纹不匹配：' + str(path))
-    return outputs, str(reply_path)
+    published = _publish_outputs(outputs, destination, name)
+    reply['published_outputs'] = published
+    write_json(reply_path, reply)
+    return published, str(reply_path)
 
 
 def package_selection(selection_path, packager_source_dir=None, packager_tools_dir=None,
-                      output_dir=None, mod_name=None, timeout=1800, adapter_path=None, report_path=None):
-    """Hold the role cache while exporting and packaging its current snapshot."""
+                      output_dir=None, mod_name=None, timeout=1800, adapter_path=None, report_path=None,
+                      selection_sha256=None):
+    """Hold the project cache while exporting and packaging its current snapshot."""
     from .cooking import lock_cook_report
     selection = json.loads(Path(selection_path).read_text(encoding='utf-8-sig'))
     with lock_cook_report(selection.get('cook_report', '')):
+        if selection_sha256 and file_sha256(selection_path) != selection_sha256:
+            raise BridgeError('资产选择已被另一次操作覆盖，请重新选择后打包。')
         return _package_selection_locked(selection_path, packager_source_dir, packager_tools_dir,
                                          output_dir, mod_name, timeout, adapter_path, report_path)
 

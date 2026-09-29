@@ -41,6 +41,14 @@ def run(request_path, report_path):
                            'classes': classes, 'dependencies': dependencies,
                            'dependency': not (package == folder or package.startswith(folder + '/'))})
             pending.update(item for item in dependencies if item not in visited and not item.startswith('/Script/'))
+        # Other roles from earlier cooks share the same sandbox. Resolve their
+        # true classes too, without loading assets or cooking the entire project.
+        for record in registry.get_assets_by_path('/Game', recursive=True, include_only_on_disk_assets=True):
+            package = str(record.package_name)
+            if package not in visited:
+                visited.add(package)
+                assets.append({'asset_path': package, 'asset_type': str(record.asset_class_path.asset_name),
+                               'dependency': not (package == folder or package.startswith(folder + '/'))})
         result.update(success=True, project_file=str(actual), character_folder=folder,
                       request_sha256=hashlib.sha256(request_path.read_bytes()).hexdigest(),
                       assets=sorted(assets, key=lambda item: item['asset_path'].casefold()))

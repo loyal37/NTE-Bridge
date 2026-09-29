@@ -92,7 +92,8 @@ class CookingTests(unittest.TestCase):
         self.assertEqual(len(first['files']), 4)
         self.assertFalse(any('T_Preview' in item['path'] or 'BP_Menu' in item['path'] for item in first['files']))
         second = stage_selection(self.selection_path)
-        self.assertNotEqual(first['run_dir'], second['run_dir'])
+        self.assertEqual(first['run_dir'], second['run_dir'])
+        self.assertNotEqual(first['run_id'], second['run_id'])
         for item in second['files']:
             self.assertEqual(file_sha256(Path(second['source_dir']) / item['path']), item['sha256'])
 
@@ -244,10 +245,11 @@ class CookingTests(unittest.TestCase):
             self.assertEqual(len(request['files']), 4)
             self.assertEqual(Path(env['TEMP']), Path(request['run_dir']) / 'temp')
             self.assertEqual(env['TEMP'], env['TMP'])
-            destination.mkdir()
+            build_output = Path(request['output_dir'])
+            build_output.mkdir()
             outputs = []
             for suffix in ('.pak', '.utoc', '.ucas'):
-                target = destination / ('SelectedMod' + suffix)
+                target = build_output / ('SelectedMod' + suffix)
                 target.write_bytes(b'packed selected assets')
                 outputs.append({'path': str(target), 'bytes': target.stat().st_size, 'sha256': file_sha256(target)})
             write_json(reply_path, dict(success=True, outputs=outputs, **{
@@ -261,6 +263,7 @@ class CookingTests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertEqual(len(result['exported_files']), 4)
         self.assertEqual(len(result['outputs']), 3)
+        self.assertTrue(all(Path(item['path']).parent == destination for item in result['outputs']))
 
     def test_report_cannot_overwrite_project_or_cooked_snapshot(self):
         for target in (self.project, self.cooked / 'HT/AssetRegistry.bin', self.report_path, self.selection_path):
@@ -276,7 +279,7 @@ class CookingTests(unittest.TestCase):
             (self.root / tool).write_bytes(b'test tool')
         destination = self.root / 'ExistingMods'
         destination.mkdir()
-        (destination / 'AlreadyExists.pak').write_bytes(b'old mod')
+        (destination / 'AlreadyExists.pak').mkdir()
         parameters = [dict(mod_name='bad name'), dict(packager_tools_dir=self.root / 'MissingTools'),
                       dict(mod_name='AlreadyExists')]
         for change in parameters:
@@ -290,9 +293,12 @@ class CookingTests(unittest.TestCase):
             export.assert_not_called()
 
     def test_open_project_is_rejected_before_catalog_or_cook_launch(self):
+        request = self.root / 'shared-cook/request.json'
+        write_json(request, self.request)
         with patch('nte_bridge.unreal_transport._project_editor_running', return_value=True), \
+                patch('nte_bridge.cooking._editor', return_value=self.root / 'editor.exe'), \
                 patch('nte_bridge.cooking._run') as launch:
-            result = cook_character(self.request_path, self.root / 'engine')
+            result = cook_character(request, self.root / 'engine')
         self.assertFalse(result['success'])
         self.assertIn('仍在打开', result['errors'][0])
         launch.assert_not_called()
@@ -305,6 +311,8 @@ class CookingTests(unittest.TestCase):
         editor.parent.mkdir(parents=True)
         editor.touch()
         captured = []
+        request = self.root / 'shared-cook/request.json'
+        write_json(request, self.request)
 
         def fake_unreal(command, log_path, timeout, env=None):
             text = command if isinstance(command, str) else ' '.join(map(str, command))
@@ -318,13 +326,16 @@ class CookingTests(unittest.TestCase):
             elif '-run=Cook' in text.replace('"', ''):
                 self.assertIn(str(self.project.parent / 'Content/Characters/A'), text)
                 self.assertIn('[Platform]', text)
+                self.assertIn('-iterate', text)
+                self.assertIn('-NODEFAULTLOG', text)
+                self.assertIn('-FullStdOutLogOutput', text)
                 shutil.copytree(self.cooked, run_root / 'cooked/Windows')
             else:
                 self.fail(text)
 
         with patch('nte_bridge.unreal_transport._project_editor_running', return_value=False), \
                 patch('nte_bridge.cooking._run', side_effect=fake_unreal):
-            result = cook_character(self.request_path, engine)
+            result = cook_character(request, engine)
         self.assertTrue(result['success'], result)
         self.assertEqual(len(captured), 2)
         self.assertEqual(len(result['assets']), len(self.types))

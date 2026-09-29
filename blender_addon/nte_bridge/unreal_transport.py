@@ -69,8 +69,12 @@ def validate_report(report, manifest_path, manifest=None):
 def _invocation_files(manifest_path):
     source = Path(manifest_path).resolve()
     invocation = uuid.uuid4().hex
-    report = source.with_name("ue_report_" + invocation + ".json")
-    runner = source.with_name("ue_run_" + invocation + ".py")
+    report = source.with_name("ue_invocation.json")
+    runner = source.with_name("ue_run.py")
+    # One invocation result is sufficient; its token, not a filename history,
+    # distinguishes a fresh response from a delayed or stale one.
+    write_json(report, {'success': False, 'stage': 'pending', 'invocation_id': invocation,
+                       'project_file': load_manifest(source)['project_file'], 'errors': ['UE task has not completed']})
     addon_root = Path(__file__).resolve().parent.parent
     runner.write_text(
         "import sys\n"
@@ -79,16 +83,19 @@ def _invocation_files(manifest_path):
         + "        del sys.modules[_nte_name]\n"
         + "sys.path.insert(0, " + repr(str(addon_root)) + ")\n"
         + "from nte_bridge.unreal_receiver import run_job\n"
-        + "result = run_job(" + repr(str(source)) + ", " + repr(str(report)) + ")\n"
+        + "result = run_job(" + repr(str(source)) + ", " + repr(str(report)) + ", invocation_id=" + repr(invocation) + ")\n"
         + "print('NTE_BRIDGE_RESULT=' + str(result['success']))\n",
         encoding="utf-8")
     return source, report, runner
 
 
-def _finish(source, report_file, manifest):
+def _finish(source, report_file, manifest, invocation_id=None):
     if not report_file.is_file():
         raise BridgeError("Unreal did not write this invocation's report; inspect its log")
-    report = validate_report(json.loads(report_file.read_text(encoding="utf-8")), source, manifest)
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    if invocation_id and report.get('invocation_id') != invocation_id:
+        raise BridgeError('UE 返回了过期的同步报告，请重新发送。')
+    report = validate_report(report, source, manifest)
     write_json(source.with_name("ue_report.json"), report)
     return report
 
@@ -149,12 +156,16 @@ def send_job(manifest_path, engine_dir=DEFAULT_ENGINE, timeout=180):
         if not isinstance(project, str) or _canonical(project) != _canonical(manifest["project_file"]):
             raise BridgeError("Connected editor failed exact project verification")
         source, report_file, runner = _invocation_files(source)
+        invocation_id = json.loads(report_file.read_text(encoding='utf-8'))['invocation_id']
         channel.settimeout(max(1, deadline - time.monotonic()))
         script = "exec(compile(open(%r, encoding='utf-8').read(), %r, 'exec'))" % (str(runner), str(runner))
         response = remote.run_command(script, exec_mode=remote_module.MODE_EXEC_STATEMENT)
-        if not response.get("success") and not report_file.is_file():
+        if not response.get("success") and (not report_file.is_file()
+                or json.loads(report_file.read_text(encoding='utf-8')).get('stage') == 'pending'):
+            write_json(report_file, {'success': False, 'stage': 'transport-failed',
+                                    'invocation_id': invocation_id, 'errors': [str(response.get('result', ''))]})
             raise BridgeError("Unreal receiver failed before writing a report: " + str(response.get("result", "")))
-        return _finish(source, report_file, manifest)
+        return _finish(source, report_file, manifest, invocation_id)
     except (TimeoutError, socket.timeout) as exc:
         message = "Unreal timed out. The import may still be running; inspect the job report before retrying"
         _transport_status(source, manifest, message)
@@ -180,7 +191,7 @@ def commandlet_command(manifest_path, engine_dir=DEFAULT_ENGINE):
             # without rewriting the user's persistent plugin configuration.
             "-EnablePlugins=" + ",".join(REQUIRED_COMMANDLET_PLUGINS),
             "-script=" + runner.as_posix(), "-unattended", "-nop4", "-nosplash", "-nullrhi",
-            "-stdout", "-FullStdOutLogOutput"]
+            "-NODEFAULTLOG", "-stdout", "-FullStdOutLogOutput"]
     return argv, report_file
 
 
@@ -220,6 +231,8 @@ def run_commandlet_job(manifest_path, engine_dir=DEFAULT_ENGINE, timeout=300):
     if _project_editor_running(manifest["project_file"]):
         raise BridgeError("目标 UE 工程仍在编辑器中打开；请先关闭该工程再后台导入，或选择发送到已打开的 UE。")
     argv, report_file = commandlet_command(source, engine_dir)
+    invocation_id = (json.loads(report_file.read_text(encoding='utf-8')).get('invocation_id')
+                     if report_file.is_file() else None)
     log_path = source.with_name("ue_commandlet.log")
     with log_path.open("w", encoding="utf-8") as log:
         try:
@@ -231,12 +244,12 @@ def run_commandlet_job(manifest_path, engine_dir=DEFAULT_ENGINE, timeout=300):
                                      timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except subprocess.TimeoutExpired as exc:
             raise BridgeError("Unreal commandlet timed out; inspect " + str(log_path)) from exc
-    if not report_file.is_file():
+    if not report_file.is_file() or json.loads(report_file.read_text(encoding='utf-8')).get('stage') == 'pending':
         message = ("UE 后台导入未生成报告（退出码 %d）。请检查引擎插件是否完整；日志：%s"
                    % (process.returncode, log_path))
         _transport_status(source, manifest, message)
         raise BridgeError(message)
-    report = _finish(source, report_file, manifest)
+    report = _finish(source, report_file, manifest, invocation_id)
     if process.returncode:
         report["success"] = False
         report["errors"].append("Unreal commandlet exited with code %d; see %s" % (process.returncode, log_path))
