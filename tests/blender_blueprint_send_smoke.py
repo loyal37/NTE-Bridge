@@ -110,13 +110,14 @@ def main():
     switch.hotkey, switch.comment, switch.input_slot_count = 'alt 6', '外套', 3
     nodes = {n.target.name: n for n in blender_nodes.object_nodes(tree)}
     new = tree.nodes.new('NTEBridgeMaterial')
-    new.mi_name, new.mi_folder, new.parent_path = 'MI_BPCoat', root + '/Mod', '/Game/BPTest/MI_Mother'
+    new.mi_name, new.parent_path = 'MI_BPCoat', '/Game/BPTest/MI_Mother'
     tree.links.new(new.outputs[0], nodes['Coat_1'].inputs[0])
     assert bpy.ops.nte_bridge.material_rows(tree_name=tree.name, node_name=new.name, action='PARENT') == {'FINISHED'}
-    new.textures.add().param = 'SkilMask'
+    assert bpy.ops.nte_bridge.material_rows(tree_name=tree.name, node_name=new.name, action='ADD') == {'FINISHED'}
+    new.params[-1].param = 'SkilMask'
     assert bpy.ops.nte_bridge.material_rows(tree_name=tree.name, node_name=new.name, action='SUGGEST') == {'FINISHED'}
     existing = tree.nodes.new('NTEBridgeMaterial')
-    existing.source, existing.material_path = 'EXISTING', '/Game/BPTest/MI_Existing'
+    existing.source, existing.material_path = 'ORIGINAL', '/Game/BPTest/MI_Existing'
     for socket in nodes['Belt_2'].inputs:
         tree.links.new(existing.outputs[0], socket)
     existing_hash = file_hash('/Game/BPTest/MI_Existing')
@@ -128,18 +129,18 @@ def main():
     assert report['success'] and report['slot_map'] == {p['id']: p['source_slot'] for p in manifest['parts']}, report['slot_map']
     assert [p['object'] for p in manifest['parts']] == ['Body', 'Body', 'Coat_1', 'Belt_2', 'Belt_2']
     assert report['morph_targets'] == ['BeltOnly', 'Smile'], report['morph_targets']
-    instance_path = root + '/Mod/MI_BPCoat'
+    instance_path = root + '/MI_BPCoat'
     instances = report['material_instances']
     assert len(instances) == 1 and instances[0]['asset_path'] == instance_path
     assert instances[0]['parent_path'] == '/Game/BPTest/MI_Mother'
     assert set(instances[0]['textures']) == {'BaseColor', 'LightMap', 'NomralMap', 'SkilMask'}
     assets = {a['asset_path']: a for a in report['assets']}
     assert assets[instance_path]['origin'] == 'mod' and assets[instance_path]['saved']
-    assert assets['/Game/BPTest/MI_Existing']['origin'] == 'existing' and not assets['/Game/BPTest/MI_Existing']['changed']
+    assert not assets['/Game/BPTest/MI_Existing']['changed']
     for texture in instances[0]['textures'].values():
         assert assets[texture]['saved'] and (CONTENT / (texture.removeprefix('/Game/') + '.uasset')).is_file(), texture
-    assert report['texture_settings'][root + '/Mod/coat__mask'] == {'compression': 'BC7', 'srgb': False, 'role': 'MASK'}
-    assert report['texture_settings'][root + '/Mod/coat_n']['compression'] == 'NORMALMAP'
+    assert report['texture_settings'][root + '/coat__mask'] == {'compression': 'BC7', 'srgb': False, 'role': 'MASK'}
+    assert report['texture_settings'][root + '/coat_n']['compression'] == 'NORMALMAP'
     assert file_hash('/Game/BPTest/MI_Existing') == existing_hash and file_hash('/Game/BPTest/MI_Mother') == mother_hash
     assert report['features_applied'] is False and len(manifest['features']) == 1
     assert blender_nodes._switch_ht_text(switch, settings) == '2,3+4（初始 0）', blender_nodes._switch_ht_text(switch, settings)
@@ -148,7 +149,9 @@ def main():
                'existing-instance-and-mother-untouched', 'switch-ht-string-from-actual-report'])
     first_instance_hash = file_hash(instance_path)
 
-    next(row for row in new.textures if row.param == 'LightMap').file_path = ''
+    light = next(socket for row, socket in zip(new.params, new.inputs) if row.param == 'LightMap')
+    light_texture = light.links[0].from_node
+    tree.links.remove(light.links[0])
     terminal, report = send(settings)
     assert terminal == {'FINISHED'}, settings.status
     assert set(report['material_instances'][0]['textures']) == {'BaseColor', 'NomralMap', 'SkilMask'}
@@ -156,12 +159,14 @@ def main():
     CHECKS.append('resend-updates-managed-instance-overrides')
     updated_hash = file_hash(instance_path)
 
-    bad = new.textures.add()
-    bad.param, bad.file_path = 'NotAParam', str(textures / 'coat_m.png')
+    assert bpy.ops.nte_bridge.material_rows(tree_name=tree.name, node_name=new.name, action='ADD') == {'FINISHED'}
+    new.params[-1].param = 'NotAParam'
+    tree.links.new(light_texture.outputs[0], new.inputs[-1])
     terminal, report = send(settings)
     assert terminal == {'CANCELLED'} and any('NotAParam' in e and '没有贴图参数' in e for e in report['errors']), report['errors']
     assert report['mutation_started'] is False and file_hash(instance_path) == updated_hash
-    new.textures.remove(len(new.textures) - 1)
+    new.params.remove(len(new.params) - 1)
+    blender_nodes.sync_material_node(new)
     CHECKS.append('missing-parent-parameter-rejected-before-mutation')
 
     new.mi_folder, new.mi_name = '/Game/BPTest', 'MI_Existing'

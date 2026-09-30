@@ -15,6 +15,7 @@ from .core import BridgeError, ht_material_ids
 TREE = 'NTEBridgeTree'
 OBJECT_SOCKET = 'NTEBridgeObjectSocket'
 MATERIAL_SOCKET = 'NTEBridgeMaterialSocket'
+TEXTURE_SOCKET = 'NTEBridgeTextureSocket'
 LEGACY_SOCKET = 'NTEBridgeSocket'
 FLOW_NODES = {'NTEBridgeObject', 'NTEBridgeGroup', 'NTEBridgeSwitch', 'NTEBridgeOutput'}
 PER_PART_PARAMETERS = ('BaseColor', 'ID_Tex', 'LightMap', 'NomralMap', 'NormalMap', 'NomrMap', 'SkilMask')
@@ -23,6 +24,8 @@ IMAGE_SUFFIXES = {'.png', '.tga', '.jpg', '.jpeg', '.bmp', '.psd', '.exr', '.dds
 ROLE_ITEMS = [('BASE_COLOR', '漫射 · BC7 / sRGB', ''), ('ID_TEX', 'ID · BC7 / 线性', ''),
               ('LIGHT_MAP', 'LightMap · BC7 / 线性', ''), ('NORMAL', '法线 · BC5 / 线性', ''),
               ('MASK', '遮罩 · BC7 / 线性', '')]
+ROLE_LABELS = {'BASE_COLOR': '漫射 · BC7 / sRGB', 'ID_TEX': 'ID · BC7 / 线性', 'LIGHT_MAP': 'LightMap · BC7 / 线性',
+               'NORMAL': '法线 · BC5 / 线性', 'MASK': '遮罩 · BC7 / 线性'}
 ROLE_SUFFIXES = {'BASE_COLOR': ('d', 'diffuse', 'basecolor', 'albedo'), 'ID_TEX': ('id',),
                  'LIGHT_MAP': ('m', 'lightmap', 'lm'), 'NORMAL': ('n', 'normal', 'nrm'), 'MASK': ('mask',)}
 _REPORT_CACHE = {}
@@ -74,6 +77,12 @@ def auto_material_path(settings, material):
     names = {material.name, re.sub(r'\.\d{3,}$', '', material.name)}
     paths = {entry.asset_path for entry in settings.material_catalog if entry.display_name in names}
     return next(iter(paths)) if len(paths) == 1 else ''
+
+
+def character_root(settings):
+    """Default UE folder for new material instances and their textures."""
+    from .blender_packaging import default_character_folder
+    return default_character_folder(settings) if settings is not None else ''
 
 
 def _ht_slot_map(settings):
@@ -128,6 +137,22 @@ class NTEBridgeMaterialSocket(bpy.types.NodeSocket):
         return (0.39, 0.78, 0.39, 1.0)
 
 
+class NTEBridgeTextureSocket(bpy.types.NodeSocket):
+    bl_idname = TEXTURE_SOCKET
+    bl_label = '贴图'
+
+    def draw(self, context, layout, node, text):
+        if self.is_output or self.is_linked:
+            layout.label(text=text)
+        else:
+            row = layout.row(align=True)
+            row.label(text=text)
+            row.label(text='继承母材质')
+
+    def draw_color(self, context, node):
+        return (0.78, 0.78, 0.16, 1.0)
+
+
 class NTEBridgeSocket(bpy.types.NodeSocket):
     """v0.3 socket, registered only so older files can be upgraded."""
     bl_idname = LEGACY_SOCKET
@@ -144,8 +169,9 @@ class NTEBridgeSocket(bpy.types.NodeSocket):
 def _sockets_compatible(source, target):
     if source.node.bl_idname == 'NodeReroute' or target.node.bl_idname == 'NodeReroute':
         return True
-    if MATERIAL_SOCKET in (source.bl_idname, target.bl_idname):
-        return source.bl_idname == target.bl_idname
+    for kind in (MATERIAL_SOCKET, TEXTURE_SOCKET):
+        if kind in (source.bl_idname, target.bl_idname):
+            return source.bl_idname == target.bl_idname
     return source.bl_idname == target.bl_idname == OBJECT_SOCKET or LEGACY_SOCKET in (
         source.bl_idname, target.bl_idname)
 
@@ -403,51 +429,81 @@ def _parent_picked(node, context):
         node.parent_path = entry.asset_path
 
 
-class NTEBridgeMaterialTexture(bpy.types.PropertyGroup):
-    param: StringProperty(name='参数', update=lambda row, context: setattr(row, 'role', role_for_parameter(row.param)))
-    file_path: StringProperty(name='贴图文件', subtype='FILE_PATH')
+def _param_renamed(row, context):
+    row.role = role_for_parameter(row.param)
+    _refresh_material_owner(row)
+
+
+def _refresh_material_owner(row):
+    pointer = row.as_pointer()
+    node = next((node for node in row.id_data.nodes if node.bl_idname == 'NTEBridgeMaterial'
+                 and any(item.as_pointer() == pointer for item in node.params)), None)
+    if node is not None:
+        sync_material_node(node)
+
+
+class NTEBridgeMaterialParam(bpy.types.PropertyGroup):
+    param_id: StringProperty()
+    param: StringProperty(name='参数', update=_param_renamed)
     role: EnumProperty(name='用途', items=ROLE_ITEMS, default='MASK')
 
 
+def sync_material_node(node):
+    """Material instances expose one texture input per parameter; originals expose none."""
+    specs = [(row.param_id, row.param or '参数') for row in node.params] if node.source == 'NEW' else []
+    _sync_sockets(node.inputs, specs, TEXTURE_SOCKET)
+
+
+def _source_changed(node, context):
+    sync_material_node(node)
+
+
+def add_material_param(node, name):
+    row = node.params.add()
+    row.param_id = 'param_' + uuid.uuid4().hex[:8]
+    row.param = name
+    return row
+
+
 class NTEBridgeMaterial(_NTENode, bpy.types.Node):
-    '''选择调用的原游戏材质、工程已有材质实例，或新建材质实例'''
+    '''原游戏材质只作引用；材质实例按母材质新建，左侧参数入口连接贴图节点'''
     bl_idname = 'NTEBridgeMaterial'
     bl_label = '材质球'
     bl_icon = 'MATERIAL'
     bl_width_min = 280
 
     node_id: StringProperty()
-    source: EnumProperty(name='来源', default='NEW', items=[
-        ('ORIGINAL', '原游戏材质', '游戏原路径材质，只作占位引用，不打包'),
-        ('EXISTING', '工程已有材质实例', 'UE 工程中已有的材质实例；桥接不修改，可作为 Mod 资产打包'),
-        ('NEW', '新建材质实例', '按母材质新建材质实例并导入覆盖贴图，作为 Mod 资产打包')])
+    source: EnumProperty(name='来源', default='NEW', update=_source_changed, items=[
+        ('ORIGINAL', '原游戏材质', '引用原路径材质，只作占位，不打包'),
+        ('NEW', '材质实例', '按母材质新建材质实例，参数入口连接贴图节点，作为 Mod 资产打包')])
     catalog_choice: StringProperty(name='原游戏材质', update=_catalog_picked)
     material_path: StringProperty(name='UE 路径', description='完整 /Game/... 路径')
     mi_name: StringProperty(name='名称', description='新材质实例名称，例如 MI_zankou_cloth')
-    mi_folder: StringProperty(name='保存目录', description='UE 目录，例如 /Game/Characters/Player/036_zankou_1/ter/cloth_ter')
+    mi_folder: StringProperty(name='保存目录', description='留空时保存到角色文件夹根目录')
     parent_choice: StringProperty(name='母材质', update=_parent_picked)
     parent_path: StringProperty(name='母材质路径', description='工程中已存在的母材质，例如 /Game/Characters/Player/019_mint/ter_new_2/cloth_ter/MI_player_019_mint_2')
-    textures: CollectionProperty(type=NTEBridgeMaterialTexture)
+    params: CollectionProperty(type=NTEBridgeMaterialParam)
+    show_params: BoolProperty(name='参数', default=False)
 
     def init(self, context):
         self.node_id = new_id()
-        self.width = 340
-        settings = _settings(context)
-        if settings and settings.mesh_path.strip():
-            self.mi_folder = settings.mesh_path.strip().rsplit('/', 1)[0] + '/ter/cloth_ter'
+        self.width = 320
         for name in DEFAULT_PARAMETERS:
-            row = self.textures.add()
-            row.param = name
+            add_material_param(self, name)
         self.outputs.new(MATERIAL_SOCKET, '材质', identifier='material')
+        sync_material_node(self)
 
     def copy(self, node):
         self.node_id = new_id()
         if self.mi_name:
             self.mi_name += '_copy'
 
-    def resolved_path(self):
+    def folder(self, settings=None):
+        return (self.mi_folder.strip().rstrip('/') or character_root(settings or _settings())).rstrip('/')
+
+    def resolved_path(self, settings=None):
         if self.source == 'NEW':
-            folder, name = self.mi_folder.strip().rstrip('/'), self.mi_name.strip()
+            folder, name = self.folder(settings), self.mi_name.strip()
             return folder + '/' + name if folder and name else ''
         return self.material_path.strip()
 
@@ -462,38 +518,103 @@ class NTEBridgeMaterial(_NTENode, bpy.types.Node):
         if self.source == 'ORIGINAL':
             if settings and settings.material_catalog:
                 layout.prop_search(self, 'catalog_choice', settings, 'material_catalog', text='')
-            layout.prop(self, 'material_path', text='')
-        elif self.source == 'EXISTING':
             row = layout.row(align=True)
             row.prop(self, 'material_path', text='')
             op = row.operator('nte_bridge.pick_project_asset', text='', icon='FILEBROWSER')
             op.tree_name, op.node_name, op.target = tree, node, 'material_path'
-        else:
-            layout.prop(self, 'mi_name')
-            layout.prop(self, 'mi_folder', text='目录')
-            layout.label(text='母材质')
-            if settings and settings.material_catalog:
-                layout.prop_search(self, 'parent_choice', settings, 'material_catalog', text='')
-            row = layout.row(align=True)
-            row.prop(self, 'parent_path', text='')
-            op = row.operator('nte_bridge.pick_project_asset', text='', icon='FILEBROWSER')
-            op.tree_name, op.node_name, op.target = tree, node, 'parent_path'
+            if self.material_path.strip():
+                layout.label(text=self.material_path.strip().rsplit('/', 1)[-1] + '（引用，不修改）')
+            return
+        layout.prop(self, 'mi_name')
+        layout.prop(self, 'mi_folder', text='目录')
+        path = self.resolved_path(settings)
+        layout.label(text=('保存到：' + path) if path else '请填写名称；目录留空为角色文件夹根目录',
+                     icon='NONE' if path else 'INFO')
+        layout.label(text='母材质')
+        if settings and settings.material_catalog:
+            layout.prop_search(self, 'parent_choice', settings, 'material_catalog', text='')
+        row = layout.row(align=True)
+        row.prop(self, 'parent_path', text='')
+        op = row.operator('nte_bridge.pick_project_asset', text='', icon='FILEBROWSER')
+        op.tree_name, op.node_name, op.target = tree, node, 'parent_path'
+        row = layout.row(align=True)
+        for action, text, icon in [('PARENT', '按母材质', 'FILE_REFRESH'), ('SUGGEST', '按后缀补全', 'VIEWZOOM')]:
+            op = row.operator('nte_bridge.material_rows', text=text, icon=icon)
+            op.tree_name, op.node_name, op.action = tree, node, action
+        layout.prop(self, 'show_params', icon='TRIA_DOWN' if self.show_params else 'TRIA_RIGHT', emboss=False)
+        if self.show_params:
             box = layout.box()
-            for index, row_data in enumerate(self.textures):
+            for index, param in enumerate(self.params):
                 row = box.row(align=True)
-                row.prop(row_data, 'param', text='')
-                row.prop(row_data, 'file_path', text='')
+                row.prop(param, 'param', text='')
+                row.prop(param, 'role', text='')
                 op = row.operator('nte_bridge.material_rows', text='', icon='X')
                 op.tree_name, op.node_name, op.action, op.index = tree, node, 'REMOVE', index
-            row = box.row(align=True)
-            for action, text, icon in [('ADD', '添加', 'ADD'), ('PARENT', '按母材质', 'FILE_REFRESH'),
-                                       ('SUGGEST', '按后缀补全', 'VIEWZOOM')]:
-                op = row.operator('nte_bridge.material_rows', text=text, icon=icon)
-                op.tree_name, op.node_name, op.action = tree, node, action
-        path = self.resolved_path()
+            op = box.operator('nte_bridge.material_rows', text='添加参数', icon='ADD')
+            op.tree_name, op.node_name, op.action = tree, node, 'ADD'
+
+
+# ----------------------------------------------------------------- texture node
+
+def _image_picked(node, context):
+    image = node.image
+    if image is not None and image.source == 'FILE' and image.filepath:
+        node.file_path = str(Path(bpy.path.abspath(image.filepath, library=image.library)).resolve())
+
+
+def texture_roles(node):
+    """Roles of the material parameters this texture feeds."""
+    roles = set()
+    for link in node.outputs[0].links:
+        target = link.to_node
+        if target.bl_idname == 'NTEBridgeMaterial':
+            row = next((row for row in target.params if row.param_id == link.to_socket.identifier), None)
+            if row is not None:
+                roles.add(row.role)
+    return roles
+
+
+class NTEBridgeTexture(_NTENode, bpy.types.Node):
+    '''选择一张贴图，连接材质实例的参数入口；用途由所连参数决定'''
+    bl_idname = 'NTEBridgeTexture'
+    bl_label = '贴图'
+    bl_icon = 'IMAGE_DATA'
+    bl_width_min = 240
+
+    node_id: StringProperty()
+    image: PointerProperty(name='Blender 图像', type=bpy.types.Image, update=_image_picked)
+    file_path: StringProperty(name='贴图文件', subtype='FILE_PATH')
+    folder: StringProperty(name='保存目录', description='留空时保存到角色文件夹根目录')
+
+    def init(self, context):
+        self.node_id = new_id()
+        self.width = 280
+        self.outputs.new(TEXTURE_SOCKET, '贴图', identifier='texture')
+
+    def copy(self, node):
+        self.node_id = new_id()
+
+    def asset_path(self, settings=None):
+        if not self.file_path.strip():
+            return ''
+        folder = (self.folder.strip().rstrip('/') or character_root(settings or _settings())).rstrip('/')
+        return folder + '/' + texture_asset_name(bpy.path.abspath(self.file_path)) if folder else ''
+
+    def draw_label(self):
+        return '贴图 · ' + Path(self.file_path).name if self.file_path.strip() else '贴图'
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'image', text='')
+        layout.prop(self, 'file_path', text='')
+        layout.prop(self, 'folder', text='目录')
+        path = self.asset_path(_settings(context))
         if path:
-            layout.label(text=path.rsplit('/', 1)[-1] + ('（新建，打包）' if self.source == 'NEW' else
-                         '（已有，可打包）' if self.source == 'EXISTING' else '（占位，不打包）'))
+            layout.label(text='UE：' + path)
+        roles = texture_roles(self)
+        if len(roles) > 1:
+            layout.label(text='连接了不同用途的参数', icon='ERROR')
+        elif roles:
+            layout.label(text=ROLE_LABELS[next(iter(roles))])
 
 
 # ------------------------------------------------------------------ switch node
@@ -827,6 +948,8 @@ def ensure_graph(settings):
     for node in tree.nodes:
         if node.bl_idname == 'NTEBridgeObject' and node != main:
             sync_object_node(node, settings)
+        elif node.bl_idname == 'NTEBridgeMaterial':
+            sync_material_node(node)
     return tree
 
 
@@ -851,7 +974,11 @@ def graph_dict(tree):
                           'parts': [slot.part_id for slot in node.slots],
                           'split': [slot.part_id for slot in node.slots if slot.split]})
         elif kind == 'NTEBridgeMaterial':
-            nodes.append({'id': node.node_id, 'type': 'MATERIAL', 'label': node.draw_label()})
+            nodes.append({'id': node.node_id, 'type': 'MATERIAL', 'label': node.draw_label(),
+                          'params': [{'id': row.param_id, 'name': row.param} for row in node.params]
+                          if node.source == 'NEW' else []})
+        elif kind == 'NTEBridgeTexture':
+            nodes.append({'id': node.node_id, 'type': 'TEXTURE', 'label': node.draw_label()})
         elif kind == 'NTEBridgeSwitch':
             nodes.append({'id': node.node_id, 'type': 'SWITCH', 'label': node.draw_label(),
                           'comment': node.comment.strip(), 'variable': node.custom_var_name.strip(),
@@ -973,35 +1100,60 @@ def _connected_diffuse(node):
     return files
 
 
-def suggest_texture_files(rows):
-    """Fill empty rows from same-folder files named <base>_<suffix>; returns filled params."""
-    base_row = next((row for row in rows if row.file_path.strip() and row.role == 'BASE_COLOR'), None) or \
-        next((row for row in rows if row.file_path.strip()), None)
-    if base_row is None:
+def _texture_node_for(tree, path, location):
+    """Reuse a texture node with the same file, otherwise create one."""
+    key = os.path.normcase(str(Path(path).resolve()))
+    for node in tree.nodes:
+        if node.bl_idname == 'NTEBridgeTexture' and node.file_path.strip() and \
+                os.path.normcase(str(Path(bpy.path.abspath(node.file_path)).resolve())) == key:
+            return node
+    node = tree.nodes.new('NTEBridgeTexture')
+    node.file_path = str(path)
+    node.location = location
+    return node
+
+
+def _linked_files(node):
+    files = {}
+    for row, socket in zip(node.params, node.inputs):
+        if socket.is_linked:
+            source = _through_reroute(socket.links[0])
+            if source and source.from_node.bl_idname == 'NTEBridgeTexture' and source.from_node.file_path.strip():
+                files[row.param_id] = Path(bpy.path.abspath(source.from_node.file_path)).resolve()
+    return files
+
+
+def suggest_texture_files(node):
+    """Link texture nodes to unconnected parameters from same-folder <base>_<suffix> files."""
+    files = _linked_files(node)
+    rows = {row.param_id: row for row in node.params}
+    base_id = next((pid for pid in files if rows[pid].role == 'BASE_COLOR'), next(iter(files), None))
+    if base_id is None:
         return []
-    source = Path(bpy.path.abspath(base_row.file_path)).resolve()
+    source = files[base_id]
     stem = _normalized_stem(source)
-    suffixes = '|'.join(ROLE_SUFFIXES[base_row.role])
-    base = re.sub(r'_(%s)\d*$' % suffixes, '', stem)
+    base = re.sub(r'_(%s)\d*$' % '|'.join(ROLE_SUFFIXES[rows[base_id].role]), '', stem)
     if base == stem or not source.parent.is_dir():
         return []
-    files = [path for path in source.parent.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES and path.is_file()]
+    candidates = [path for path in source.parent.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES and path.is_file()]
     filled = []
-    for row in rows:
-        if row.file_path.strip():
+    for index, (row, socket) in enumerate(zip(node.params, node.inputs)):
+        if socket.is_linked:
             continue
         wanted = {base + '_' + suffix for suffix in ROLE_SUFFIXES[row.role]}
-        matches = [path for path in files if _normalized_stem(path) in wanted]
+        matches = [path for path in candidates if _normalized_stem(path) in wanted]
         if len(matches) == 1:
-            row.file_path = str(matches[0])
+            location = (node.location.x - 340, node.location.y - index * 150)
+            texture = _texture_node_for(node.id_data, matches[0], location)
+            node.id_data.links.new(texture.outputs[0], socket)
             filled.append(row.param)
     return filled
 
 
 class NTEBRIDGE_OT_material_rows(bpy.types.Operator):
     bl_idname = 'nte_bridge.material_rows'
-    bl_label = '编辑贴图参数'
-    bl_description = '添加/删除贴图行；按母材质生成参数行；按同目录文件后缀补全空行'
+    bl_label = '编辑材质参数'
+    bl_description = '添加/删除参数入口；按母材质生成参数入口；按同目录文件后缀为空入口连接贴图节点'
     bl_options = {'REGISTER', 'UNDO'}
     tree_name: StringProperty()
     node_name: StringProperty()
@@ -1013,9 +1165,9 @@ class NTEBRIDGE_OT_material_rows(bpy.types.Operator):
         if node is None or node.bl_idname != 'NTEBridgeMaterial':
             return {'CANCELLED'}
         if self.action == 'ADD':
-            node.textures.add()
-        elif self.action == 'REMOVE' and 0 <= self.index < len(node.textures):
-            node.textures.remove(self.index)
+            add_material_param(node, 'Parameter')
+        elif self.action == 'REMOVE' and 0 <= self.index < len(node.params):
+            node.params.remove(self.index)
         elif self.action == 'PARENT':
             settings = context.scene.nte_bridge
             entry = next((item for item in settings.material_catalog
@@ -1025,20 +1177,22 @@ class NTEBRIDGE_OT_material_rows(bpy.types.Operator):
                 declared = {reference.get('name', '') for reference in json.loads(entry.metadata_json).get('textures', [])}
                 names = [name for name in PER_PART_PARAMETERS if name in declared]
             names = names or list(DEFAULT_PARAMETERS)
-            files = {row.param: row.file_path for row in node.textures}
-            node.textures.clear()
+            kept = {row.param: row.param_id for row in node.params}
+            node.params.clear()
             for name in names:
-                row = node.textures.add()
-                row.param = name
-                row.file_path = files.get(name, '')
-            base = next((row for row in node.textures if row.role == 'BASE_COLOR'), None)
+                row = add_material_param(node, name)
+                row.param_id = kept.get(name, row.param_id)
+            sync_material_node(node)
+            base = next(((row, socket) for row, socket in zip(node.params, node.inputs) if row.role == 'BASE_COLOR'), None)
             diffuse = _connected_diffuse(node)
-            if base is not None and not base.file_path and len(diffuse) == 1:
-                base.file_path = next(iter(diffuse))
-            self.report({'INFO'}, '已按%s生成 %d 个贴图参数' % ('母材质资料' if entry and entry.available else '常用参数', len(names)))
+            if base is not None and not base[1].is_linked and len(diffuse) == 1:
+                texture = _texture_node_for(node.id_data, next(iter(diffuse)), (node.location.x - 340, node.location.y))
+                node.id_data.links.new(texture.outputs[0], base[1])
+            self.report({'INFO'}, '已按%s生成 %d 个参数入口' % ('母材质资料' if entry and entry.available else '常用参数', len(names)))
         elif self.action == 'SUGGEST':
-            filled = suggest_texture_files(node.textures)
-            self.report({'INFO'}, ('已补全：' + '、'.join(filled)) if filled else '没有找到唯一匹配的同名后缀贴图')
+            filled = suggest_texture_files(node)
+            self.report({'INFO'}, ('已连接：' + '、'.join(filled)) if filled else '没有找到唯一匹配的同名后缀贴图')
+        sync_material_node(node)
         return {'FINISHED'}
 
 
@@ -1197,6 +1351,7 @@ def _node_add_menu(self, context):
     self.layout.separator()
     for node_type, label, icon in [('NTEBridgeObject', '物体', 'OBJECT_DATAMODE'),
                                    ('NTEBridgeMaterial', '材质球', 'MATERIAL'),
+                                   ('NTEBridgeTexture', '贴图', 'IMAGE_DATA'),
                                    ('NTEBridgeSwitch', '物体切换', 'SHADERFX'),
                                    ('NTEBridgeGroup', '群组', 'GROUP'),
                                    ('NTEBridgeOutput', '生成', 'EXPORT')]:
@@ -1215,8 +1370,8 @@ def _object_context_menu(self, context):
                          icon='SHADERFX').mode = 'SWITCH'
 
 
-CLASSES = (NTEBridgeObjectSocket, NTEBridgeMaterialSocket, NTEBridgeSocket, NTEBridgeTree,
-           NTEBridgeObjectSlot, NTEBridgeObject, NTEBridgeMaterialTexture, NTEBridgeMaterial,
+CLASSES = (NTEBridgeObjectSocket, NTEBridgeMaterialSocket, NTEBridgeTextureSocket, NTEBridgeSocket, NTEBridgeTree,
+           NTEBridgeObjectSlot, NTEBridgeObject, NTEBridgeMaterialParam, NTEBridgeMaterial, NTEBridgeTexture,
            NTEBridgeSwitch, NTEBridgeGroup, NTEBridgeOutput, NTEBridgeStateEntry, NTEBridgePart,
            NTEBridgeCycle, NTEBRIDGE_OT_sync_blueprint, NTEBRIDGE_OT_select_node_object,
            NTEBRIDGE_OT_switch_option, NTEBRIDGE_OT_material_rows, NTEBRIDGE_OT_pick_project_asset,

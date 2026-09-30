@@ -1,4 +1,14 @@
-# v0.4.0 验证记录
+# v0.4.1 验证记录
+
+日期：2026-09-30。按用户要求调整材质球：分为“原游戏材质”（只引用，无参数入口）与“材质实例”（左侧暴露贴图参数入口），新增“贴图”节点连接参数；材质实例和贴图默认保存到角色文件夹根目录。
+
+- 119 项纯 Python 检查通过；新增贴图只能连接材质实例参数入口、材质球入口只接受贴图、失效参数入口拒绝。
+- Blender 蓝图冒烟 11 项：材质实例默认暴露 BaseColor / ID_Tex / LightMap / NomralMap 入口，改名后入口与用途同步；“按母材质”由已连接槽的漫射图创建 BaseColor 贴图节点；“按后缀补全”创建并连接 LightMap / NomralMap / SkilMask 贴图节点且不重复创建；实例与贴图默认路径为角色根目录；原游戏材质无入口；同一贴图连到不同用途参数时拒绝。其余 FBX、缓存、预览、角色资料、烘焙界面、设置保存回归通过。
+- 实际后台 UE 发送 10 项通过：材质实例由贴图节点提供 BaseColor / LightMap / NomralMap / SkilMask，实例与贴图保存在角色根目录；断开 LightMap 连线后重复发送，实例只剩三个覆盖；缺参数和目标路径已有非桥接实例仍在修改资产前失败；已有实例与母材质字节不变。全新 UE 进程回读确认实例父级、覆盖、桥接标记及网格五个槽材质。单物体实际发送回归 12 项通过。
+
+本地证据：`artifacts/blender_blueprint_smoke/result.json`、`artifacts/blender_blueprint_send_smoke/result.json`、`artifacts/ue-blueprint-readback.log`。只提交 main，不创建标签或 Release，未安装到用户 Blender。
+
+## v0.4.0 验证记录
 
 日期：2026-09-30。测试使用指定的 Blender 4.5.7 LTS 与隔离 UE 5.6.1 工程 `artifacts/ue_smoke`，未操作用户的 HT 工程和 Blender 文件。
 

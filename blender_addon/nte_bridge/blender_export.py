@@ -15,8 +15,7 @@ from mathutils import Matrix
 
 from .core import BridgeError, compile_blueprint, package_path, validate_manifest, write_json
 from .blender_cache import ensure_cache
-from .blender_nodes import (IMAGE_SUFFIXES, auto_material_path, ensure_graph, graph_dict, object_nodes,
-                            texture_asset_name)
+from .blender_nodes import IMAGE_SUFFIXES, auto_material_path, ensure_graph, graph_dict, object_nodes
 from .blender_textures import discover_material_previews, stage_preview_images
 from .workspace import directory_lock, owned_directory, check_background_use
 
@@ -51,7 +50,8 @@ class _Materials:
     def __init__(self, settings, plan):
         self.settings, self.plan = settings, plan
         self.nodes = {node.node_id: node for node in settings.graph.nodes if node.bl_idname == 'NTEBridgeMaterial'}
-        self.specs, self.paths, self.textures, self.staging, self.targets = {}, {}, {}, [], {}
+        self.texture_nodes = {node.node_id: node for node in settings.graph.nodes if node.bl_idname == 'NTEBridgeTexture'}
+        self.specs, self.paths, self.textures, self.staging = {}, {}, {}, []
 
     def resolve(self, part_id, blender_material, default, label):
         mid = self.plan['part_materials'].get(part_id)
@@ -65,8 +65,10 @@ class _Materials:
         raise BridgeError("材质槽“%s”没有材质：请连接材质球节点，或在“材质与部件”中映射。" % label)
 
     def _node(self, node):
-        path = node.resolved_path()
         label = '材质球“%s”' % node.name
+        if node.source == 'NEW' and not node.folder(self.settings):
+            raise BridgeError(label + "无法确定角色文件夹，请填写保存目录。")
+        path = node.resolved_path(self.settings)
         if not path:
             raise BridgeError(label + "尚未填写完整的 UE 路径或名称。")
         package_path(path, label + '路径')
@@ -76,44 +78,52 @@ class _Materials:
         if owner and owner != node.node_id:
             raise BridgeError(label + "与另一个材质球使用了同一个路径：" + path)
         self.paths[path.casefold()] = node.node_id
-        if node.source == 'EXISTING':
-            self.specs[node.node_id] = {"id": node.node_id, "kind": "existing", "asset_path": path}
-            return path
         parent = package_path(node.parent_path.strip(), label + '母材质')
-        folder = path.rsplit('/', 1)[0]
+        links = self.plan['material_textures'].get(node.node_id, {})
         parameters = {}
-        for row in node.textures:
+        for row in node.params:
+            texture_id = links.get(row.param_id)
+            if texture_id is None:
+                continue  # Unlinked parameters inherit the mother material.
             param = row.param.strip()
-            if not row.file_path.strip():
-                continue
             if not param:
-                raise BridgeError(label + "有贴图文件未填写参数名。")
+                raise BridgeError(label + "有已连接贴图的参数未填写名称。")
             if param in parameters:
                 raise BridgeError(label + "的参数重复：" + param)
-            source = Path(bpy.path.abspath(row.file_path)).resolve()
-            if not source.is_file():
-                raise BridgeError(label + "的贴图文件不存在：" + row.file_path)
-            if source.suffix.lower() not in IMAGE_SUFFIXES:
-                raise BridgeError(label + "的贴图格式不受支持：" + source.name)
-            key = os.path.normcase(str(source))
-            record = self.textures.get(key)
-            if record is None:
-                asset = folder + '/' + texture_asset_name(source)
-                other = self.targets.get(asset.casefold())
-                if other and other != key:
-                    raise BridgeError("两个不同的贴图文件会导入到同一个 UE 路径：" + asset)
-                self.targets[asset.casefold()] = key
-                texture_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'nte-material-texture:' + key))
-                record = {"id": texture_id, "source_file": "textures/" + uuid.UUID(texture_id).hex + source.suffix.lower(),
-                          "asset_path": asset, "role": row.role, "origin": "mod"}
-                self.textures[key] = record
-                self.staging.append((source, record["source_file"]))
-            elif record["role"] != row.role:
-                raise BridgeError("同一张贴图被设置成不同用途：" + source.name)
-            parameters[param] = record["asset_path"]
+            parameters[param] = self._texture(self.texture_nodes[texture_id], row.role)
         self.specs[node.node_id] = {"id": node.node_id, "kind": "new", "asset_path": path,
                                     "parent_path": parent, "textures": parameters}
         return path
+
+    def _texture(self, node, role):
+        label = '贴图节点“%s”' % node.name
+        if not node.file_path.strip():
+            raise BridgeError(label + "尚未选择贴图文件。")
+        source = Path(bpy.path.abspath(node.file_path)).resolve()
+        if not source.is_file():
+            raise BridgeError(label + "的贴图文件不存在：" + node.file_path)
+        if source.suffix.lower() not in IMAGE_SUFFIXES:
+            raise BridgeError(label + "的贴图格式不受支持：" + source.name)
+        asset = node.asset_path(self.settings)
+        if not asset:
+            raise BridgeError(label + "无法确定角色文件夹，请填写保存目录。")
+        package_path(asset, label + ' UE 路径')
+        key = asset.casefold()
+        record = self.textures.get(key)
+        if record is None:
+            texture_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'nte-material-texture:' + key))
+            record = {"id": texture_id, "source_file": "textures/" + uuid.UUID(texture_id).hex + source.suffix.lower(),
+                      "asset_path": asset, "role": role, "origin": "mod", "_source": os.path.normcase(str(source))}
+            self.textures[key] = record
+            self.staging.append((source, record["source_file"]))
+        elif record["_source"] != os.path.normcase(str(source)):
+            raise BridgeError("两个不同的贴图文件会导入到同一个 UE 路径：" + asset)
+        elif record["role"] != role:
+            raise BridgeError(label + "连接了不同用途的参数（%s / %s）。" % (record["role"], role))
+        return asset
+
+    def manifest_textures(self):
+        return [{key: value for key, value in record.items() if key != "_source"} for record in self.textures.values()]
 
 
 def profile_manifest(settings, job_id=None, preview_staging=None, export_plan=None):
@@ -196,7 +206,7 @@ def profile_manifest(settings, job_id=None, preview_staging=None, export_plan=No
                          "source_file": "textures/" + uuid.UUID(entry.texture_id).hex + path.suffix.lower(),
                          "asset_path": entry.asset_path.strip(), "role": entry.role, "origin": "mod"})
     manual_count = len(textures)
-    textures.extend(materials.textures.values())
+    textures.extend(materials.manifest_textures())
     preview_textures, material_previews, staging = discover_material_previews(settings, textures[:manual_count], previews)
     textures.extend(preview_textures)
     if preview_staging is not None:

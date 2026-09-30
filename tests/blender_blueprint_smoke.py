@@ -173,30 +173,52 @@ def main():
     require(not any(s.hide for s in coat_node.inputs) and [s.name for s in belt_node.inputs] ==
             ['BeltMaterial', 'BeltMaterial'], 'custom object material inputs incorrect')
     new_material = tree.nodes.new('NTEBridgeMaterial')
-    require(new_material.mi_folder == '/Game/BP/ter/cloth_ter', 'new material folder default incorrect')
+    require(new_material.source == 'NEW' and [s.name for s in new_material.inputs] ==
+            ['BaseColor', 'ID_Tex', 'LightMap', 'NomralMap'], 'material instance did not expose parameter inputs')
     new_material.mi_name = 'MI_BP_Coat'
+    require(new_material.resolved_path(settings) == '/Game/BP/MI_BP_Coat', 'instance does not default to the character root')
     new_material.parent_path = '/Game/BP/MI_Mother'
     tree.links.new(new_material.outputs[0], coat_node.inputs[0])
     require(bpy.ops.nte_bridge.material_rows(tree_name=tree.name, node_name=new_material.name, action='PARENT') == {'FINISHED'},
             'parent parameter rows failed')
-    rows = {row.param: row for row in new_material.textures}
-    require(Path(rows['BaseColor'].file_path).name == 'coat_d.png', 'BaseColor was not read from the linked Blender diffuse')
-    new_material.textures.add().param = 'SkilMask'
+
+    def linked_textures():
+        result = {}
+        for row, socket in zip(new_material.params, new_material.inputs):
+            if socket.is_linked:
+                result[row.param] = socket.links[0].from_node
+        return result
+
+    base = linked_textures().get('BaseColor')
+    require(base is not None and Path(base.file_path).name == 'coat_d.png',
+            'BaseColor texture node was not created from the linked Blender diffuse')
+    require(bpy.ops.nte_bridge.material_rows(tree_name=tree.name, node_name=new_material.name, action='ADD') == {'FINISHED'},
+            'adding a parameter failed')
+    new_material.params[-1].param = 'SkilMask'
+    require(new_material.inputs[-1].name == 'SkilMask' and new_material.params[-1].role == 'MASK',
+            'renamed parameter did not update its input and role')
     require(bpy.ops.nte_bridge.material_rows(tree_name=tree.name, node_name=new_material.name, action='SUGGEST') == {'FINISHED'},
             'suffix suggestion failed')
-    rows = {row.param: row for row in new_material.textures}
-    require(Path(rows['LightMap'].file_path).name == 'coat_m.png' and Path(rows['NomralMap'].file_path).name == 'coat_n.png'
-            and Path(rows['SkilMask'].file_path).name == 'coat_ mask.png' and not rows['ID_Tex'].file_path,
-            'suffix suggestion filled wrong files: %r' % {k: v.file_path for k, v in rows.items()})
-    require([rows[name].role for name in ('BaseColor', 'ID_Tex', 'LightMap', 'NomralMap', 'SkilMask')] ==
-            ['BASE_COLOR', 'ID_TEX', 'LIGHT_MAP', 'NORMAL', 'MASK'], 'texture roles not derived from parameters')
-    check('material-node-parent-rows-and-suffix-suggestion')
+    linked = {name: Path(node.file_path).name for name, node in linked_textures().items()}
+    require(linked == {'BaseColor': 'coat_d.png', 'LightMap': 'coat_m.png', 'NomralMap': 'coat_n.png',
+                       'SkilMask': 'coat_ mask.png'}, 'suffix suggestion linked wrong textures: %r' % linked)
+    textures_nodes = [n for n in tree.nodes if n.bl_idname == 'NTEBridgeTexture']
+    require(len(textures_nodes) == 4, 'texture nodes were duplicated')
+    require([row.role for row in new_material.params] == ['BASE_COLOR', 'ID_TEX', 'LIGHT_MAP', 'NORMAL', 'MASK'],
+            'texture roles not derived from parameters')
+    require(linked_textures()['BaseColor'].asset_path(settings) == '/Game/BP/coat_d', 'texture does not default to character root')
+    check('material-instance-inputs-texture-nodes-and-suffix-suggestion')
 
-    existing = tree.nodes.new('NTEBridgeMaterial')
-    existing.source = 'EXISTING'
-    existing.material_path = '/Game/BP/MI_Existing'
+    original = tree.nodes.new('NTEBridgeMaterial')
+    original.source = 'ORIGINAL'
+    require(len(original.inputs) == 0, 'original material exposed parameter inputs')
+    original.material_path = '/Game/BP/MI_Existing'
     for socket in belt_node.inputs:
-        tree.links.new(existing.outputs[0], socket)
+        tree.links.new(original.outputs[0], socket)
+    conflict = tree.links.new(base.outputs[0], new_material.inputs[1])
+    must_fail(lambda: profile_manifest(settings), '不同用途')
+    tree.links.remove(conflict)
+    check('original-material-has-no-inputs-and-role-conflict-rejected')
     reroute = tree.nodes.new('NodeReroute')
     coat_link = switch.inputs[0].links[0]
     tree.links.remove(coat_link)
@@ -207,15 +229,17 @@ def main():
     part_objects = [part['object'] for part in manifest['parts']]
     require(part_objects == ['Body', 'Body', 'Coat_1', 'Belt_2', 'Belt_2'], 'export slot order incorrect: %r' % part_objects)
     require([part['source_slot'] for part in manifest['parts']] == list(range(5)), 'joined slots not contiguous')
-    specs = {spec['kind']: spec for spec in manifest['materials']}
-    require(specs['new']['asset_path'] == '/Game/BP/ter/cloth_ter/MI_BP_Coat' and
-            specs['new']['parent_path'] == '/Game/BP/MI_Mother' and
-            set(specs['new']['textures']) == {'BaseColor', 'LightMap', 'NomralMap', 'SkilMask'},
-            'new material spec incorrect: %r' % specs.get('new'))
-    require(specs['new']['textures']['SkilMask'] == '/Game/BP/ter/cloth_ter/coat__mask', 'mask texture name incorrect')
-    require(specs['existing']['asset_path'] == '/Game/BP/MI_Existing', 'existing material spec missing')
+    require(len(manifest['materials']) == 1, 'unexpected material specs: %r' % manifest['materials'])
+    spec = manifest['materials'][0]
+    require(spec['kind'] == 'new' and spec['asset_path'] == '/Game/BP/MI_BP_Coat' and
+            spec['parent_path'] == '/Game/BP/MI_Mother' and
+            set(spec['textures']) == {'BaseColor', 'LightMap', 'NomralMap', 'SkilMask'},
+            'new material spec incorrect: %r' % spec)
+    require(spec['textures']['SkilMask'] == '/Game/BP/coat__mask', 'mask texture name incorrect')
+    require([part['material_path'] for part in manifest['parts'][3:]] == ['/Game/BP/MI_Existing'] * 2,
+            'referenced instance not assigned to belt slots')
     exported = {asset['asset_path']: asset['asset_type'] for asset in manifest['export_assets']}
-    require(exported.get('/Game/BP/ter/cloth_ter/MI_BP_Coat') == 'MaterialInstanceConstant' and
+    require(exported.get('/Game/BP/MI_BP_Coat') == 'MaterialInstanceConstant' and
             '/Game/BP/MI_Existing' not in exported, 'material export list incorrect')
     roles = {t['asset_path'].rsplit('/', 1)[-1]: t['role'] for t in manifest['textures']}
     require(roles == {'coat_d': 'BASE_COLOR', 'coat_m': 'LIGHT_MAP', 'coat_n': 'NORMAL', 'coat__mask': 'MASK'},

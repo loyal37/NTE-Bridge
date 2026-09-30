@@ -7,7 +7,7 @@ import re
 import tempfile
 
 SCHEMA_VERSION = 1
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 HIDDEN_STATE = "$hidden"
 
 
@@ -320,7 +320,7 @@ def validate_manifest(data, job_dir=None):
     return data
 
 
-NODE_TYPES = {"OBJECT", "MATERIAL", "SWITCH", "GROUP", "OUTPUT"}
+NODE_TYPES = {"OBJECT", "MATERIAL", "TEXTURE", "SWITCH", "GROUP", "OUTPUT"}
 _FLOW_SOURCES = {"OBJECT", "GROUP", "SWITCH"}
 _FLOW_TARGETS = {"GROUP", "SWITCH", "OUTPUT"}
 
@@ -361,7 +361,7 @@ def compile_blueprint(graph):
     mains = [nid for nid, node in nodes.items() if node["type"] == "OBJECT" and node.get("main")]
     _require(len(mains) <= 1, "蓝图只能有一个主网格物体节点")
 
-    flow, materials, used_sockets = {nid: [] for nid in nodes}, {}, set()
+    flow, materials, textures, used_sockets = {nid: [] for nid in nodes}, {}, {}, set()
     for link in links:
         src, dst = link.get("from_node"), link.get("to_node")
         _require(src in nodes and dst in nodes, "连线引用了不存在的节点")
@@ -370,6 +370,12 @@ def compile_blueprint(graph):
         _require((dst, socket) not in used_sockets, f"节点「{name(dst)}」插口 {socket}: 只能连接一条线")
         used_sockets.add((dst, socket))
         src_type, dst_type = nodes[src]["type"], nodes[dst]["type"]
+        if src_type == "TEXTURE":
+            params = {param["id"] for param in nodes[dst].get("params", [])} if dst_type == "MATERIAL" else set()
+            _require(socket in params, f"贴图节点「{name(src)}」只能连接材质实例的参数入口")
+            textures.setdefault(dst, {})[socket] = src
+            continue
+        _require(dst_type != "MATERIAL", f"材质球「{name(dst)}」的入口只能连接贴图节点")
         if src_type == "MATERIAL":
             _require(dst_type == "OBJECT" and socket in nodes[dst]["parts"],
                      f"材质节点「{name(src)}」只能连接物体节点左侧的材质入口")
@@ -464,4 +470,6 @@ def compile_blueprint(graph):
     used = {mid for mid in part_materials.values() if mid}
     return {"graph_id": graph["id"], "objects": included, "main": mains[0] if mains else "",
             "part_materials": part_materials,
-            "materials": {mid: nodes[mid] for mid in sorted(used)}, "features": features}
+            "materials": {mid: nodes[mid] for mid in sorted(used)},
+            "material_textures": {mid: dict(textures.get(mid, {})) for mid in sorted(used)},
+            "features": features}

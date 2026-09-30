@@ -32,7 +32,10 @@ def blueprint_fixture():
         {"id": "coat", "type": "OBJECT", "label": "coat", "object_id": "Coat", "parts": ["c0"]},
         {"id": "belt", "type": "OBJECT", "label": "belt", "object_id": "Belt", "parts": ["b0", "b1"]},
         {"id": "unused", "type": "OBJECT", "label": "ref", "object_id": "Reference", "parts": ["r0"]},
-        {"id": "mat", "type": "MATERIAL", "label": "MI_coat"},
+        {"id": "mat", "type": "MATERIAL", "label": "MI_coat",
+         "params": [{"id": "param_base", "name": "BaseColor"}, {"id": "param_mask", "name": "SkilMask"}]},
+        {"id": "tex", "type": "TEXTURE", "label": "coat_d"},
+        {"id": "loose", "type": "TEXTURE", "label": "unused"},
         {"id": "grp", "type": "GROUP", "label": "长袖"},
         {"id": "sw", "type": "SWITCH", "label": "外套", "comment": "外套", "key": "alt 6", "variable": "swapkey0",
          "options": ["option_0", "option_1", "option_2"], "initial_option": 0},
@@ -44,7 +47,8 @@ def blueprint_fixture():
         {"from_node": "grp", "from_socket": "out", "to_node": "sw", "to_socket": "option_0"},
         {"from_node": "coat", "from_socket": "all", "to_node": "sw", "to_socket": "option_2"},
         {"from_node": "sw", "from_socket": "out", "to_node": "out", "to_socket": "in_2"},
-        {"from_node": "mat", "from_socket": "material", "to_node": "coat", "to_socket": "c0"}]
+        {"from_node": "mat", "from_socket": "material", "to_node": "coat", "to_socket": "c0"},
+        {"from_node": "tex", "from_socket": "texture", "to_node": "mat", "to_socket": "param_base"}]
     return {"id": "graph", "nodes": nodes, "links": links}
 
 
@@ -65,6 +69,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(plan["part_materials"]["c0"], "mat")
         self.assertIsNone(plan["part_materials"]["p0"])
         self.assertEqual(list(plan["materials"]), ["mat"])
+        self.assertEqual(plan["material_textures"], {"mat": {"param_base": "tex"}})
         feature = plan["features"][0]
         self.assertEqual([state["parts"] for state in feature["states"]], [["p1", "b0", "b1"], [], ["c0"]])
         self.assertEqual(feature["initial_state_id"], "sw/option_0")
@@ -111,6 +116,24 @@ class ContractTests(unittest.TestCase):
         graph["links"] = [link for link in graph["links"] if link["from_socket"] != "p1"]
         node(graph, "main")["split"] = []
         with self.assertRaisesRegex(BridgeError, "主网格"):
+            compile_blueprint(graph)
+
+    def test_texture_links_only_feed_material_parameters(self):
+        graph = blueprint_fixture()
+        graph["links"].append({"from_node": "loose", "from_socket": "texture", "to_node": "belt", "to_socket": "b0"})
+        with self.assertRaisesRegex(BridgeError, "只能连接材质实例的参数入口"):
+            compile_blueprint(graph)
+        graph = blueprint_fixture()
+        graph["links"].append({"from_node": "loose", "from_socket": "texture", "to_node": "mat", "to_socket": "param_gone"})
+        with self.assertRaisesRegex(BridgeError, "只能连接材质实例的参数入口"):
+            compile_blueprint(graph)
+        graph = blueprint_fixture()
+        graph["links"].append({"from_node": "belt", "from_socket": "all", "to_node": "mat", "to_socket": "param_mask"})
+        with self.assertRaisesRegex(BridgeError, "只能连接贴图节点"):
+            compile_blueprint(graph)
+        graph = blueprint_fixture()
+        node(graph, "mat")["params"] = []
+        with self.assertRaisesRegex(BridgeError, "参数入口"):
             compile_blueprint(graph)
 
     def test_switch_requires_content_and_unique_controls(self):
