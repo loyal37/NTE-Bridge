@@ -146,41 +146,67 @@ def _original_texture_path(settings, material_path, image, matching_manual):
                       (material_path, image.name))
 
 
-def discover_material_previews(settings, manual_textures):
-    """Return automatic texture records, material bindings and a local staging plan."""
+def discover_material_previews(settings, manual_textures, parts=None):
+    """Return automatic texture records, material bindings and a local staging plan.
+
+    ``parts`` items provide source_material, material_path and optional. Optional
+    parts (extra blueprint objects) skip previews they cannot resolve exactly.
+    """
     manual = []
     for entry, record in zip(settings.textures, manual_textures):
         if record['role'] == 'BASE_COLOR':
             manual.append((Path(bpy.path.abspath(entry.file_path)).resolve(), record))
     image_sources, textures, staging, targets, bindings, target_sources = {}, {}, [], {}, {}, {}
     manual_targets = {record['asset_path'].casefold(): record for record in manual_textures}
-    for part in settings.parts:
-        image = material_diffuse_image(part.source_material)
+    for part in (settings.parts if parts is None else parts):
+        optional = getattr(part, 'optional', False)
+        try:
+            image = material_diffuse_image(part.source_material)
+        except BridgeError:
+            if optional:
+                continue
+            raise
         if image is None:
             continue
         pointer = image.as_pointer()
         if pointer not in image_sources:
-            image_sources[pointer] = _source(image)
+            try:
+                image_sources[pointer] = _source(image)
+            except BridgeError:
+                if optional:
+                    continue
+                raise
         source = image_sources[pointer]
         identity = source['identity']
         material_key = part.material_path.strip().casefold()
         if material_key in targets and targets[material_key] != identity:
+            if optional:
+                continue
             raise BridgeError('多个 Blender 材质映射到同一个 UE 材质“%s”，但漫射贴图不同；请先调整材质映射。' % part.material_path)
-        targets[material_key] = identity
         matching = [record for path, record in manual if
                     (source['mode'] == 'file' and path == source['path']) or
                     (source['mode'] == 'packed' and hashlib.sha256(path.read_bytes()).hexdigest() ==
                      hashlib.sha256(source['data']).hexdigest())]
-        texture_path = _original_texture_path(settings, part.material_path.strip(), image, matching)
+        try:
+            texture_path = _original_texture_path(settings, part.material_path.strip(), image, matching)
+        except BridgeError:
+            if optional:
+                continue
+            raise
         texture_key = texture_path.casefold()
         if texture_key in target_sources and target_sources[texture_key] != identity:
+            if optional:
+                continue
             raise BridgeError('不同漫射图像指向同一个原游戏贴图路径，请检查映射：' + texture_path)
+        existing = manual_targets.get(texture_key)
+        if texture_key not in textures and existing and existing not in matching:
+            if optional:
+                continue
+            raise BridgeError('自动漫射与手动替换贴图使用同一路径，但源图像或用途不同：' + texture_path)
+        targets[material_key] = identity
         target_sources[texture_key] = identity
         if texture_key not in textures:
-            existing = manual_targets.get(texture_key)
             if existing:
-                if existing not in matching:
-                    raise BridgeError('自动漫射与手动替换贴图使用同一路径，但源图像或用途不同：' + texture_path)
                 textures[texture_key] = existing
             else:
                 texture_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'nte-preview:' + texture_key))

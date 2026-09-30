@@ -266,17 +266,22 @@ def main():
     # Replacing a source material must retain a linked part's identity while
     # clearing its obsolete material mapping until the user reconciles it.
     changed_id = settings.parts[0].part_id
-    linked_part = next(node for node in settings.graph.nodes
-                       if node.bl_idname == 'NTEBridgePart' and node.part_id == changed_id)
+    main_node = next(node for node in settings.graph.nodes
+                     if node.bl_idname == 'NTEBridgeObject' and node.is_main)
+    main_node.slots[0].split = True
+    linked_output = next(socket for socket in main_node.outputs if socket.identifier == changed_id)
     linked_group = settings.graph.nodes.new('NTEBridgeGroup')
-    settings.graph.links.new(linked_part.outputs[0], linked_group.inputs[0])
+    settings.graph.links.new(linked_output, linked_group.inputs[0])
+    output_node = next(node for node in settings.graph.nodes if node.bl_idname == 'NTEBridgeOutput')
+    settings.graph.links.new(linked_group.outputs[0], output_node.inputs[-1])
     settings.mesh.data.materials[0] = bpy.data.materials.new("AChangedSourceMaterial")
     must_reject(lambda: profile_manifest(settings), "Changed slot material exported stale mapping")
     check("changed_source_slot_requires_reconciliation")
     require(bpy.ops.nte_bridge.refresh_slots() == {"FINISHED"}, "Replaced material could not be reconciled")
-    require(settings.parts[0].part_id == changed_id and linked_part.part_id == changed_id,
+    linked_output = next((socket for socket in main_node.outputs if socket.identifier == changed_id), None)
+    require(settings.parts[0].part_id == changed_id and linked_output is not None,
             "Source material replacement invalidated its linked part identity")
-    require(linked_part.outputs[0].is_linked and linked_group.inputs[0].is_linked,
+    require(linked_output.is_linked and linked_group.inputs[0].is_linked,
             "Source material replacement removed a user's graph link")
     require(not settings.parts[0].material_path and not settings.parts[0].catalog_material
             and not settings.parts[0].automatic_material_path,
@@ -336,8 +341,10 @@ def main():
             not settings.parts[0].material_path,
             "Replacement C stole a moved material identity or stale mapping")
     valid_part_ids = {part.part_id for part in settings.parts}
-    require(all(node.part_id in valid_part_ids for node in settings.graph.nodes
-                if node.bl_idname == 'NTEBridgePart'), "Unlinked removed-part node remained invalid")
+    moved_main = next(node for node in settings.graph.nodes if node.bl_idname == 'NTEBridgeObject' and node.is_main)
+    require({slot.part_id for slot in moved_main.slots} == valid_part_ids and
+            {socket.identifier for socket in moved_main.inputs} == valid_part_ids,
+            "Main object node kept a removed part identity")
     settings.parts[0].material_path = "/Game/Custom/ReplacementC"
     require(len(profile_manifest(settings)["parts"]) == 2,
             "Mixed move/replacement left an invalid graph after mapping")

@@ -1,4 +1,4 @@
-"""Small, purpose-built node editor and explicit single-character profile."""
+"""Character profile sidebar, send/cook/package operators and panels."""
 
 from pathlib import Path
 import json
@@ -11,12 +11,12 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
-from .blender_export import finish_job, graph_dict, new_id, prepare_job, profile_manifest, release_job
+from .blender_export import finish_job, new_id, prepare_job, profile_manifest, release_job
 from .core import BridgeError, write_json
 from .discovery import scan_character
 from .workflow import detect_engine_dir, detect_packager_source
 from .blender_cache import _directory, ensure_cache, selected_manifest
-from . import blender_assets, blender_state
+from . import blender_assets, blender_nodes, blender_state
 from .blender_packaging import (TYPE_ITEMS, TYPE_LABELS, TYPE_ICONS, asset_dialog_width, asset_visible, character_folder,
     clear_cook, cook_excluded_assets, default_character_folder, load_cooked_assets, resolved_project,
     selection_request, size_label, verified_cook, visible_assets, worker_python)
@@ -43,6 +43,7 @@ def _catalog_changed(part, context):
 def _material_path_changed(part, context):
     if part.automatic_material_path and part.material_path != part.automatic_material_path:
         part.automatic_material_path = ''
+    blender_nodes.refresh_auto_labels(getattr(getattr(context, 'scene', None), 'nte_bridge', None))
 
 
 class NTEBridgePartEntry(bpy.types.PropertyGroup):
@@ -89,210 +90,6 @@ class NTEBridgeCookedAssetEntry(bpy.types.PropertyGroup):
     packable: BoolProperty(default=False)
     dependency: BoolProperty(default=False)
     reason: StringProperty()
-
-
-class NTEBridgeStateEntry(bpy.types.PropertyGroup):
-    state_id: StringProperty()
-    label: StringProperty(name="状态名")
-
-
-class NTEBridgeSocket(bpy.types.NodeSocket):
-    bl_idname = 'NTEBridgeSocket'
-    bl_label = 'NTE 部件 / 状态'
-    socket_id: StringProperty()
-
-    def draw(self, context, layout, node, text):
-        layout.label(text=text)
-
-    def draw_color(self, context, node):
-        return (0.13, 0.65, 0.62, 1.0)
-
-
-class NTEBridgeTree(bpy.types.NodeTree):
-    bl_idname = 'NTEBridgeTree'
-    bl_label = 'NTE Bridge · 角色功能图'
-    bl_icon = 'NODETREE'
-    graph_id: StringProperty()
-
-
-def _socket(node, output, label, socket_id=None):
-    socket = (node.outputs if output else node.inputs).new('NTEBridgeSocket', label)
-    socket.socket_id = socket_id or new_id()
-    if not output:
-        socket.link_limit = 1
-    return socket
-
-
-class _NTEBase:
-    @classmethod
-    def poll(cls, tree):
-        return tree.bl_idname == 'NTEBridgeTree'
-
-    def copy(self, source):
-        self.node_id = new_id()
-        if self.bl_idname == 'NTEBridgeCycle':
-            old_initial = self.initial_state_id
-            for state, socket in zip(self.states, self.inputs):
-                old_id = state.state_id
-                state.state_id = new_id()
-                socket.socket_id = state.state_id
-                if old_initial == old_id:
-                    self.initial_state_id = state.state_id
-
-
-def _part_items(node, context):
-    settings = getattr(getattr(context, 'scene', None), 'nte_bridge', None)
-    items = [(p.part_id, '%d · %s' % (p.source_slot, p.display_name), '', i)
-             for i, p in enumerate(settings.parts)] if settings else []
-    if not items:
-        items = [('NONE', '请先刷新角色部件槽', '', 0)]
-    _ENUM_CACHE[('part', node.as_pointer())] = items
-    return items
-
-
-def _part_get(node):
-    settings = getattr(bpy.context.scene, 'nte_bridge', None)
-    if settings:
-        for i, part in enumerate(settings.parts):
-            if part.part_id == node.part_id:
-                return i
-    return 0
-
-
-def _part_set(node, value):
-    settings = bpy.context.scene.nte_bridge
-    if 0 <= value < len(settings.parts):
-        part = settings.parts[value]
-        node.part_id = part.part_id
-        node.label = part.display_name
-
-
-class NTEBridgePart(_NTEBase, bpy.types.Node):
-    bl_idname = 'NTEBridgePart'
-    bl_label = '部件'
-    node_id: StringProperty()
-    part_id: StringProperty()
-    part_choice: EnumProperty(name="角色部件", items=_part_items, get=_part_get, set=_part_set)
-
-    def init(self, context):
-        self.node_id = new_id()
-        self.width = 235
-        _socket(self, True, '部件')
-
-    def draw_buttons(self, context, layout):
-        layout.prop(self, 'part_choice', text='')
-        if not self.part_id:
-            layout.label(text='请选择部件', icon='ERROR')
-
-
-class NTEBridgeGroup(_NTEBase, bpy.types.Node):
-    bl_idname = 'NTEBridgeGroup'
-    bl_label = '组合 / 一个状态'
-    node_id: StringProperty()
-
-    def init(self, context):
-        self.node_id = new_id()
-        self.width = 200
-        _socket(self, False, '部件 1')
-        _socket(self, True, '组合')
-
-    def update(self):
-        if self.inputs and self.inputs[-1].is_linked:
-            _socket(self, False, '部件 %d' % (len(self.inputs) + 1))
-
-    def draw_buttons(self, context, layout):
-        layout.prop(self, 'label', text='名称')
-
-
-def _initial_items(node, context):
-    items = [(state.state_id, state.label or '状态 %d' % (i + 1), '', i)
-             for i, state in enumerate(node.states)]
-    if node.include_hidden:
-        items.append(('$hidden', '全部隐藏', '', len(items)))
-    _ENUM_CACHE[('initial', node.as_pointer())] = items
-    return items
-
-
-def _initial_get(node):
-    for i, state in enumerate(node.states):
-        if state.state_id == node.initial_state_id:
-            return i
-    if node.initial_state_id == '$hidden' and node.include_hidden:
-        return len(node.states)
-    return 0
-
-
-def _initial_set(node, value):
-    if value < len(node.states):
-        node.initial_state_id = node.states[value].state_id
-    elif node.include_hidden and value == len(node.states):
-        node.initial_state_id = '$hidden'
-
-
-def _hidden_changed(node, context):
-    if not node.include_hidden and node.initial_state_id == '$hidden' and node.states:
-        node.initial_state_id = node.states[0].state_id
-
-
-class NTEBridgeCycle(_NTEBase, bpy.types.Node):
-    bl_idname = 'NTEBridgeCycle'
-    bl_label = '材质组循环'
-    node_id: StringProperty()
-    states: CollectionProperty(type=NTEBridgeStateEntry)
-    feature_label: StringProperty(name="功能名称", default='服装切换')
-    key: StringProperty(name="按键", default='K')
-    include_hidden: BoolProperty(name="追加全部隐藏", default=False, update=_hidden_changed)
-    initial_state_id: StringProperty()
-    initial_choice: EnumProperty(name="初始状态", items=_initial_items, get=_initial_get, set=_initial_set)
-
-    def add_state(self):
-        state = self.states.add()
-        state.state_id = new_id()
-        state.label = '状态 %d' % len(self.states)
-        _socket(self, False, state.label, state.state_id)
-        if not self.initial_state_id:
-            self.initial_state_id = state.state_id
-
-    def init(self, context):
-        self.node_id = new_id()
-        self.width = 255
-        self.add_state()
-        self.add_state()
-        _socket(self, True, '功能')
-
-    def draw_buttons(self, context, layout):
-        layout.prop(self, 'feature_label')
-        layout.prop(self, 'key')
-        layout.prop(self, 'include_hidden')
-        layout.prop(self, 'initial_choice')
-        row = layout.row(align=True)
-        for action, text in [('ADD', '增加状态'), ('REMOVE', '删除末状态')]:
-            op = row.operator('nte_bridge.edit_state', text=text)
-            op.tree_name = self.id_data.name
-            op.node_name = self.name
-            op.action = action
-        layout.label(text='配置预览，暂不生成游戏切换', icon='INFO')
-
-
-class NTEBridgeOutput(_NTEBase, bpy.types.Node):
-    bl_idname = 'NTEBridgeOutput'
-    bl_label = '角色输出'
-    node_id: StringProperty()
-
-    def init(self, context):
-        self.node_id = new_id()
-        self.width = 260
-        _socket(self, False, '功能 1')
-
-    def update(self):
-        if self.inputs and self.inputs[-1].is_linked:
-            _socket(self, False, '功能 %d' % (len(self.inputs) + 1))
-
-    def draw_buttons(self, context, layout):
-        layout.label(text='网格与贴图由角色配置导出')
-        layout.label(text='没有切换功能时可保持不连接')
-        layout.operator('nte_bridge.validate', text='校验并预览配置', icon='CHECKMARK')
-        layout.operator('nte_bridge.send', text='发送到 UE', icon='EXPORT')
 
 
 def _source_data(settings):
@@ -419,26 +216,8 @@ def _refresh_parts(settings):
         part.automatic_material_path = automatic
     settings.active_part = min(settings.active_part, max(0, len(settings.parts) - 1))
     settings.bound_mesh = settings.mesh
-    if not settings.graph:
-        settings.graph = bpy.data.node_groups.new('NTE · ' + settings.mesh.name, 'NTEBridgeTree')
-        settings.graph.graph_id = new_id()
-        settings.graph.use_fake_user = True
-    valid_ids = {part.part_id for part in settings.parts}
-    for node in list(settings.graph.nodes):
-        if (node.bl_idname == 'NTEBridgePart' and node.part_id not in valid_ids
-                and not any(socket.is_linked for socket in node.outputs)):
-            settings.graph.nodes.remove(node)
-    existing = {n.part_id for n in settings.graph.nodes if n.bl_idname == 'NTEBridgePart'}
-    for index, part in enumerate(settings.parts):
-        if part.part_id not in existing:
-            node = settings.graph.nodes.new('NTEBridgePart')
-            node.part_id = part.part_id
-            node.label = part.display_name
-            node.location = (0, -index * 95)
-    if not any(n.bl_idname == 'NTEBridgeOutput' for n in settings.graph.nodes):
-        node = settings.graph.nodes.new('NTEBridgeOutput')
-        node.location = (720, 0)
     _fill_material_mappings(settings)
+    blender_nodes.ensure_graph(settings)
 
 
 def _mesh_changed(settings, context):
@@ -489,6 +268,11 @@ def _restore_cache(_unused=None):
             except (BridgeError, OSError, ValueError, KeyError):
                 clear_cook(settings)
         blender_state.restore_session(settings)
+        if settings.graph is not None and settings.mesh is not None:
+            try:
+                blender_nodes.ensure_graph(settings)
+            except (BridgeError, RuntimeError, ReferenceError) as error:
+                settings.status = '角色蓝图需要刷新：' + str(error)
 
 
 @persistent
@@ -561,6 +345,7 @@ class NTEBridgeSettings(bpy.types.PropertyGroup):
     last_manifest: StringProperty(name="最近任务", subtype='FILE_PATH')
     last_report: StringProperty(name="最近报告", subtype='FILE_PATH')
     status: StringProperty(default='先读取解包的角色文件夹，再选择 Blender 网格。')
+    blueprint_summary: StringProperty(options={'SKIP_SAVE'})
     busy: BoolProperty(default=False, options={'SKIP_SAVE'})
     progress_text: StringProperty(options={'SKIP_SAVE'})
     progress_factor: FloatProperty(default=-1.0, min=-1.0, max=1.0, options={'SKIP_SAVE'})
@@ -615,6 +400,7 @@ class NTEBRIDGE_OT_scan_character(bpy.types.Operator):
             else:
                 settings.source_mesh_choice = ''
             loaded = sum(item.available for item in settings.material_catalog)
+            blender_nodes.refresh_auto_labels(settings)
             settings.discovery_status = '%d 个网格 · %d 份材质信息' % (len(settings.source_meshes), loaded)
             settings.status = ('已读取角色；请选择原始骨骼网格并点击使用。'
                                if not settings.source_mesh_choice else '角色信息已更新；已有部件和手动映射已保留。')
@@ -718,30 +504,6 @@ class NTEBRIDGE_OT_source_report(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class NTEBRIDGE_OT_edit_state(bpy.types.Operator):
-    bl_idname = 'nte_bridge.edit_state'
-    bl_label = '修改循环状态'
-    bl_options = {'REGISTER', 'UNDO'}
-    tree_name: StringProperty()
-    node_name: StringProperty()
-    action: StringProperty()
-
-    def execute(self, context):
-        tree = bpy.data.node_groups.get(self.tree_name)
-        node = tree.nodes.get(self.node_name) if tree else None
-        if not node or node.bl_idname != 'NTEBridgeCycle':
-            return {'CANCELLED'}
-        if self.action == 'ADD':
-            node.add_state()
-        elif len(node.states) > 2 or (node.include_hidden and len(node.states) > 1):
-            removed = node.states[-1].state_id
-            node.inputs.remove(node.inputs[-1])
-            node.states.remove(len(node.states) - 1)
-            if node.initial_state_id == removed:
-                node.initial_state_id = node.states[0].state_id
-        return {'FINISHED'}
-
-
 class NTEBRIDGE_OT_edit_texture(bpy.types.Operator):
     bl_idname = 'nte_bridge.edit_texture'
     bl_label = '修改贴图清单'
@@ -787,14 +549,52 @@ class NTEBRIDGE_OT_validate(bpy.types.Operator):
             text = bpy.data.texts.get('NTE Bridge 配置预览.json') or bpy.data.texts.new('NTE Bridge 配置预览.json')
             text.clear()
             text.write(json.dumps(manifest, ensure_ascii=False, indent=2))
-            settings.status = '校验通过：%d 部件，%d 贴图，%d 待生成运行时功能。' % (
-                len(manifest['parts']), len(manifest['textures']), len(manifest['features']))
+            settings.blueprint_summary = _blueprint_summary(manifest)
+            settings.status = '校验通过：' + settings.blueprint_summary
             self.report({'INFO'}, settings.status)
             return {'FINISHED'}
         except (BridgeError, ValueError, OSError) as error:
             settings.status = str(error)
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
+
+
+def _blueprint_summary(manifest):
+    objects = len({part.get('object', '') for part in manifest['parts']})
+    return '%d 个物体 · %d 个材质槽 · %d 个新建材质 · %d 个切换' % (
+        objects, len(manifest['parts']), sum(m['kind'] == 'new' for m in manifest.get('materials', [])),
+        len(manifest['features']))
+
+
+class NTEBRIDGE_OT_slot_table(bpy.types.Operator):
+    bl_idname = 'nte_bridge.slot_table'
+    bl_label = '槽位表'
+    bl_description = '列出 UE 槽号、物体、材质槽、材质与所属切换选项'
+
+    def execute(self, context):
+        settings = context.scene.nte_bridge
+        try:
+            manifest = profile_manifest(settings)
+        except (BridgeError, ValueError, OSError) as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        options = {}
+        for feature in manifest['features']:
+            for index, state in enumerate(feature['states']):
+                for part in state['parts']:
+                    options[part] = '%s · 选项_%d' % (feature['label'], index)
+        sent = blender_nodes._ht_slot_map(settings)
+        lines = ['UE 槽号（发送前为预计值）\t物体\t材质槽\t材质\t切换']
+        for part in manifest['parts']:
+            slot = sent.get(part['id'], part['source_slot'])
+            lines.append('%s\t%s\t%s\t%s\t%s' % (slot, part.get('object', ''), part['display_name'],
+                                                   part['material_path'], options.get(part['id'], '常驻')))
+        text = bpy.data.texts.get('NTE Bridge 槽位表') or bpy.data.texts.new('NTE Bridge 槽位表')
+        text.clear()
+        text.write('\n'.join(lines) + '\n')
+        settings.blueprint_summary = _blueprint_summary(manifest)
+        self.report({'INFO'}, '槽位表已写入文本“NTE Bridge 槽位表”')
+        return {'FINISHED'}
 
 
 def _engine_path(settings):
@@ -1466,15 +1266,18 @@ class NTEBRIDGE_PT_textures(_NTEChildPanel, bpy.types.Panel):
 
 
 class NTEBRIDGE_PT_nodes(_NTEChildPanel, bpy.types.Panel):
-    bl_label = '功能节点'
+    bl_label = '角色蓝图'
     bl_idname = 'NTEBRIDGE_PT_nodes'
     bl_order = 3
 
     def draw(self, context):
         column = _panel_column(self, context)
-        column.label(text='仅配置预览，尚未生成 UE 功能', icon='INFO')
-        column.operator('nte_bridge.open_graph', icon='NODETREE')
-        column.operator('nte_bridge.validate', icon='CHECKMARK')
+        column.operator('nte_bridge.open_graph', text='打开角色蓝图', icon='NODETREE')
+        row = column.row(align=True)
+        row.operator('nte_bridge.validate', text='校验', icon='CHECKMARK')
+        row.operator('nte_bridge.slot_table', text='槽位表', icon='TEXT')
+        if context.scene.nte_bridge.blueprint_summary:
+            _wrapped(column, context.scene.nte_bridge.blueprint_summary, context)
 
 
 class NTEBRIDGE_PT_send(_NTEChildPanel, bpy.types.Panel):
@@ -1553,23 +1356,11 @@ class NTEBRIDGE_PT_advanced(_NTEChildPanel, bpy.types.Panel):
         _wide_prop(paths, settings, 'cook_report')
 
 
-def _add_menu(self, context):
-    space = context.space_data
-    if space and space.type == 'NODE_EDITOR' and space.tree_type == 'NTEBridgeTree':
-        self.layout.separator()
-        for node_type, label in [('NTEBridgePart', 'NTE · 部件'), ('NTEBridgeGroup', 'NTE · 组合'),
-                                 ('NTEBridgeCycle', 'NTE · 材质组循环'), ('NTEBridgeOutput', 'NTE · 角色输出')]:
-            op = self.layout.operator('node.add_node', text=label)
-            op.type = node_type
-            op.use_transform = True
-
-
 CLASSES = (NTEBridgePartEntry, NTEBridgeSourceMeshEntry, NTEBridgeMaterialEntry,
-           NTEBridgeTextureEntry, NTEBridgeCookedAssetEntry, NTEBridgeStateEntry, NTEBridgeSocket,
-           NTEBridgeTree, NTEBridgePart, NTEBridgeGroup, NTEBridgeCycle, NTEBridgeOutput,
+           NTEBridgeTextureEntry, NTEBridgeCookedAssetEntry,
            NTEBridgeSettings, NTEBRIDGE_OT_scan_character, NTEBRIDGE_OT_apply_source,
-           NTEBRIDGE_OT_refresh_slots, NTEBRIDGE_OT_source_report, NTEBRIDGE_OT_edit_state,
-           NTEBRIDGE_OT_edit_texture, NTEBRIDGE_OT_open_graph, NTEBRIDGE_OT_validate,
+           NTEBRIDGE_OT_refresh_slots, NTEBRIDGE_OT_source_report,
+           NTEBRIDGE_OT_edit_texture, NTEBRIDGE_OT_open_graph, NTEBRIDGE_OT_validate, NTEBRIDGE_OT_slot_table,
            NTEBRIDGE_OT_export, NTEBRIDGE_OT_send, NTEBRIDGE_OT_worker, NTEBRIDGE_UL_parts,
            NTEBRIDGE_OT_choose_cook_folder, NTEBRIDGE_OT_cook, NTEBRIDGE_OT_select_filtered_cooked, NTEBRIDGE_UL_cooked_assets, NTEBRIDGE_OT_select_cooked_assets, NTEBRIDGE_OT_asset_dialog,
            NTEBRIDGE_UL_textures, NTEBRIDGE_PT_main, NTEBRIDGE_PT_materials,
@@ -1577,10 +1368,10 @@ CLASSES = (NTEBridgePartEntry, NTEBridgeSourceMeshEntry, NTEBridgeMaterialEntry,
            NTEBRIDGE_PT_send, NTEBRIDGE_PT_package, NTEBRIDGE_PT_advanced)
 
 def register():
+    blender_nodes.register()
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     bpy.types.Scene.nte_bridge = PointerProperty(type=NTEBridgeSettings)
-    bpy.types.NODE_MT_add.append(_add_menu)
     bpy.app.handlers.load_post.append(_restore_cache)
     bpy.app.handlers.save_post.append(_save_packaging_state)
     if hasattr(bpy.data, 'scenes'):
@@ -1597,9 +1388,9 @@ def unregister():
         bpy.app.handlers.load_post.remove(_restore_cache)
     if _save_packaging_state in bpy.app.handlers.save_post:
         bpy.app.handlers.save_post.remove(_save_packaging_state)
-    bpy.types.NODE_MT_add.remove(_add_menu)
     if hasattr(bpy.types.Scene, 'nte_bridge'):
         del bpy.types.Scene.nte_bridge
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
+    blender_nodes.unregister()
     _ENUM_CACHE.clear()

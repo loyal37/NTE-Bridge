@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'blender_addon'))
 import nte_bridge
 from nte_bridge.blender_export import export_job, graph_dict, profile_manifest
-from nte_bridge.core import compile_graph
+from nte_bridge.core import compile_blueprint
 
 
 def require(condition, message):
@@ -148,15 +148,21 @@ def main():
     mesh.modifiers.remove(unsupported)
     # Unequal state groups are exercised by the core tests; here test Blender socket serialization.
     tree = settings.graph
-    cycle = tree.nodes.new('NTEBridgeCycle')
-    part_nodes = [n for n in tree.nodes if n.bl_idname == 'NTEBridgePart']
+    main_node = next(n for n in tree.nodes if n.bl_idname == 'NTEBridgeObject' and n.is_main)
     output_node = next(n for n in tree.nodes if n.bl_idname == 'NTEBridgeOutput')
-    tree.links.new(part_nodes[0].outputs[0], cycle.inputs[0])
-    tree.links.new(part_nodes[1].outputs[0], cycle.inputs[1])
-    link = tree.links.new(cycle.outputs[0], output_node.inputs[0])
-    features = compile_graph(graph_dict(tree), manifest['parts'])
-    require(len(features) == 1 and len(features[0]['states']) == 2, 'cycle graph did not compile')
-    tree.links.remove(link)
+    main_node.slots[1].split = True
+    switch = tree.nodes.new('NTEBridgeSwitch')
+    switch.hotkey = 'alt 6'
+    split_output = next(s for s in main_node.outputs if s.identifier == main_node.slots[1].part_id)
+    tree.links.new(split_output, switch.inputs[0])
+    link = tree.links.new(switch.outputs[0], output_node.inputs[-1])
+    plan = compile_blueprint(graph_dict(tree))
+    require(len(plan['features']) == 1 and [s['parts'] for s in plan['features'][0]['states']] ==
+            [[main_node.slots[1].part_id], []], 'switch with an empty option did not compile')
+    tree.nodes.remove(switch)
+    main_node.slots[1].split = False
+    output_node.update()
+    require(not profile_manifest(settings)['features'], 'removing the switch left runtime behavior')
     source = output / 'synthetic_source.blend'
     bpy.ops.wm.save_as_mainfile(filepath=str(source))
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -211,7 +217,7 @@ def main():
                                         'bone_names': [bone.name for bone in imported_rig.data.bones],
                                         'smoothing_mapping': smoothing_fields[b'MappingInformationType'].decode('ascii'),
                                         'smoothing_values': list(smoothing_fields[b'Smoothing'])},
-              'checks': ['register', 'duplicate-material-slots', 'stable-save-reload-ids', 'node-cycle-compile',
+              'checks': ['register', 'duplicate-material-slots', 'stable-save-reload-ids', 'node-switch-compile',
                          'source-scene-unchanged', 'source-file-unchanged', 'fbx-slots', 'fbx-morphs', 'fbx-bones', 'fbx-uv',
                          'four-texture-roles', 'texture-copy-hashes', 'reject-topology-modifier',
                          'fbx-no-animation', 'fbx-face-smoothing']}

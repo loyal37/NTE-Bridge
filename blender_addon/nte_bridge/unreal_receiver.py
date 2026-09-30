@@ -143,6 +143,78 @@ def _check_editor_dependencies(unreal):
                             "若使用已打开的 UE，请在插件设置中启用这些插件并重启编辑器。当前尚未修改资产。")
 
 
+_INSTANCE_OWNER_TAG = "NTEBridge.MaterialInstanceOwner"
+_INSTANCE_OWNER = "NTEBridge.MaterialInstance.v1"
+
+
+def _texture_parameter_names(unreal, parent):
+    base = parent if isinstance(parent, unreal.Material) else parent.get_base_material()
+    if base is None:
+        return set()
+    return {str(name) for name in unreal.MaterialEditingLibrary.get_texture_parameter_names(base)}
+
+
+def _check_material_instances(unreal, manifest):
+    """Validate every new/existing instance before any mutation."""
+    checked = {}
+    for spec in manifest.get("materials", []):
+        path = spec["asset_path"]
+        if spec["kind"] == "existing":
+            found = _asset(unreal, path, unreal.MaterialInterface)
+            if found is None:
+                raise BridgeError("工程中找不到材质：" + path + "。请改用“新建材质实例”或检查路径。")
+            continue
+        existing = _asset(unreal, path, unreal.MaterialInstanceConstant)
+        if existing is not None and unreal.EditorAssetLibrary.get_metadata_tag(existing, _INSTANCE_OWNER_TAG) != _INSTANCE_OWNER:
+            raise BridgeError("目标路径已有不是桥接创建的材质实例，未覆盖：" + path + "。请改名，或改用“工程已有材质实例”。")
+        parent = _asset(unreal, spec["parent_path"], unreal.MaterialInterface)
+        if parent is None:
+            raise BridgeError("母材质不在工程中：" + spec["parent_path"] + "。请先导入该角色，或选择工程中已有的母材质。")
+        if _package(parent) == path:
+            raise BridgeError("材质实例不能以自己为母材质：" + path)
+        names = _texture_parameter_names(unreal, parent)
+        missing = sorted(name for name in spec["textures"] if name not in names)
+        if missing:
+            raise BridgeError("母材质 %s 没有贴图参数 %s；现有参数：%s" % (
+                spec["parent_path"], "、".join(missing), "、".join(sorted(names)) or "无"))
+        checked[path] = (spec, parent, existing)
+    return checked
+
+
+def _create_material_instance(unreal, path, parent, existing):
+    instance = existing
+    if instance is None:
+        folder, name = path.rsplit("/", 1)
+        instance = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+            name, folder, unreal.MaterialInstanceConstant, unreal.MaterialInstanceConstantFactoryNew())
+        if instance is None:
+            raise BridgeError("无法创建材质实例：" + path)
+        unreal.EditorAssetLibrary.set_metadata_tag(instance, _INSTANCE_OWNER_TAG, _INSTANCE_OWNER)
+    unreal.MaterialEditingLibrary.set_material_instance_parent(instance, parent)
+    return instance
+
+
+def _apply_material_instance(unreal, instance, spec, parent, textures, report):
+    """Managed instances carry only the declared texture overrides."""
+    library = unreal.MaterialEditingLibrary
+    library.clear_all_material_instance_parameters(instance)
+    for name, texture_path in spec["textures"].items():
+        # UE 5.6 returns False from this setter even after writing; verify the overrides below.
+        library.set_material_instance_texture_parameter_value(instance, name, textures[texture_path.casefold()])
+    library.update_material_instance(instance)
+    if instance.get_editor_property("parent") != parent:
+        raise BridgeError("材质实例母材质回读失败：" + spec["asset_path"])
+    overrides = {str(value.get_editor_property("parameter_info").get_editor_property("name")):
+                 value.get_editor_property("parameter_value")
+                 for value in instance.get_editor_property("texture_parameter_values")}
+    expected = {name: textures[path.casefold()] for name, path in spec["textures"].items()}
+    if overrides != expected:
+        raise BridgeError("材质实例贴图覆盖回读不一致：%s（实际 %s）" % (
+            spec["asset_path"], sorted(overrides)))
+    report.setdefault("material_instances", []).append(
+        {"asset_path": spec["asset_path"], "parent_path": _package(parent), "textures": dict(spec["textures"])})
+
+
 _PREVIEW_OWNER_TAG = "NTEBridge.PreviewOwner"
 _PREVIEW_NODE_TAG = "NTEBridge.PreviewBaseColorNode"
 _PREVIEW_OWNER = "NTEBridge.BaseColorPreview.v1"
@@ -229,9 +301,10 @@ def _run(unreal, manifest, job_dir, report):
         missing.append(mesh_spec["skeleton_path"])
     if physics_path and physics is None:
         missing.append(physics_path)
+    instances = _check_material_instances(unreal, manifest)
     for part in manifest["parts"]:
         material_path = part["material_path"]
-        if material_path not in materials:
+        if material_path not in materials and material_path not in instances:
             materials[material_path] = _asset(unreal, material_path, unreal.MaterialInterface)
             if materials[material_path] is None:
                 missing.append(material_path)
@@ -260,6 +333,7 @@ def _run(unreal, manifest, job_dir, report):
     # All validation above precedes mutations. A failed import can still change in-memory assets;
     # the report explicitly lists partial changes instead of claiming transaction rollback.
     created_materials = set()
+    existing_paths = {spec["asset_path"].casefold() for spec in manifest.get("materials", []) if spec["kind"] == "existing"}
     for path, material in list(materials.items()):
         if material is None:
             report["mutation_started"] = True
@@ -271,7 +345,10 @@ def _run(unreal, manifest, job_dir, report):
             materials[path] = remember(material, "game_placeholder")
             created_materials.add(path)
         else:
-            remember(material, "game_placeholder", save=False)
+            remember(material, "existing" if path.casefold() in existing_paths else "game_placeholder", save=False)
+    for path, (spec, parent, existing) in instances.items():
+        report["mutation_started"] = True
+        materials[path] = remember(_create_material_instance(unreal, path, parent, existing), "mod")
 
     options = unreal.FbxImportUI()
     for name, value in {"automated_import_should_detect_type": False,
@@ -386,6 +463,10 @@ def _run(unreal, manifest, job_dir, report):
         report.setdefault("texture_settings", {})[entry["asset_path"]] = {
             "compression": settings["compression"], "srgb": bool(texture.get_editor_property("srgb")),
             "role": entry["role"]}
+
+    for path, (spec, parent, _) in instances.items():
+        _apply_material_instance(unreal, materials[path], spec, parent, textures, report)
+        remember(materials[path], "mod")
 
     material_paths = {path.casefold(): path for path in materials}
     for preview in manifest.get("material_previews", []):
