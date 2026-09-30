@@ -1,4 +1,15 @@
-# v0.4.1 验证记录
+# v0.4.2 验证记录
+
+日期：2026-09-30。按用户要求：角色蓝图在独立窗口打开（同 LoyalTools）；蓝图中其他物体的槽在 UE 中使用 Blender 材质槽名。
+
+- 120 项纯 Python 检查通过（新增自定义槽名不能为空）。
+- 实际 Blender 4.5.7 窗口测试 3 项：侧栏打开角色蓝图会新建一个只含该蓝图节点编辑器的独立窗口，编辑器固定到该蓝图，主窗口 3D 视图不变；打开后执行“显示全部”，所有节点都在视图内；再次打开关闭旧窗口并重建，不累积窗口。已查看截图：节点表头、图标和物体切换布局与 LoyalTools 一致。
+- Blender 蓝图冒烟 11 项通过，清单中主网格槽无自定义槽名，外套/腰带槽为 `CoatMaterial` / `BeltMaterial`。
+- 实际后台 UE 发送 11 项通过（新增：报告与 UE 槽名为 `M_Main`×2、`CoatMaterial`、`BeltMaterial`×2）；全新 UE 进程回读网格槽名一致。单物体实际发送回归 12 项及其余 Blender 回归通过。
+
+本地证据：`artifacts/blender_blueprint_window/result.json` 与截图、`artifacts/blender_blueprint_send_smoke/result.json`、`artifacts/ue-blueprint-readback.log`。只提交 main，不创建标签或 Release；按用户要求安装到 Blender 4.5.7。
+
+## v0.4.1 验证记录
 
 日期：2026-09-30。按用户要求调整材质球：分为“原游戏材质”（只引用，无参数入口）与“材质实例”（左侧暴露贴图参数入口），新增“贴图”节点连接参数；材质实例和贴图默认保存到角色文件夹根目录。
 

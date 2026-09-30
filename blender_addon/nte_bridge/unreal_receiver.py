@@ -427,7 +427,9 @@ def _run(unreal, manifest, job_dir, report):
     for part in manifest["parts"]:
         index = slot_indices[part["slot_key"]]
         slots[index].set_editor_property("material_interface", materials[part["material_path"]])
-        slots[index].set_editor_property("material_slot_name", materials[part["material_path"]].get_name())
+        slot_name = part.get("ue_slot_name") or materials[part["material_path"]].get_name()
+        slots[index].set_editor_property("material_slot_name", slot_name)
+        report.setdefault("slot_names", {})[part["id"]] = slot_name
         # Imported identities remain unique even when visible names/materials match.
         report["slot_map"][part["id"]] = index
     mesh.set_editor_property("materials", slots)

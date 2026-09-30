@@ -522,19 +522,60 @@ class NTEBRIDGE_OT_edit_texture(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _frame_blueprint(pointer, attempts):
+    """Show all nodes once the new window has a drawable region (same as View > Frame All)."""
+    window = next((item for item in bpy.context.window_manager.windows if item.as_pointer() == pointer), None)
+    area = max(window.screen.areas, key=lambda item: item.width * item.height) if window else None
+    region = next((item for item in area.regions if item.type == 'WINDOW'), None) if area else None
+    if region is None or area.type != 'NODE_EDITOR':
+        return None
+    if region.width > 100 and region.height > 100:
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            bpy.ops.node.view_all()
+        return None
+    attempts['left'] -= 1
+    return 0.25 if attempts['left'] > 0 else None
+
+
 class NTEBRIDGE_OT_open_graph(bpy.types.Operator):
     bl_idname = 'nte_bridge.open_graph'
-    bl_label = '打开角色节点图'
+    bl_label = '打开角色蓝图'
+    bl_description = '在独立窗口中打开当前角色蓝图；已打开时关闭旧窗口并重新打开'
 
     def execute(self, context):
-        tree = context.scene.nte_bridge.graph
-        if not tree:
-            self.report({'ERROR'}, '请先初始化节点图')
+        settings = context.scene.nte_bridge
+        tree = blender_nodes.ensure_graph(settings)
+        if tree is None:
+            self.report({'ERROR'}, '请先选择 Blender 网格。')
             return {'CANCELLED'}
-        context.area.type = 'NODE_EDITOR'
-        context.area.ui_type = 'NTEBridgeTree'
-        context.area.spaces.active.node_tree = tree
-        context.area.spaces.active.pin = True
+        manager = context.window_manager
+        for window in list(manager.windows):
+            shows_tree = any(space.type == 'NODE_EDITOR' and space.node_tree == tree
+                             for area in window.screen.areas for space in area.spaces)
+            if shows_tree and window != context.window and len(manager.windows) > 1:
+                with context.temp_override(window=window):
+                    bpy.ops.wm.window_close()
+        previous = {window.as_pointer() for window in manager.windows}
+        if context.area is not None:
+            # A duplicated area becomes a window holding only the blueprint editor.
+            bpy.ops.screen.area_dupli('INVOKE_DEFAULT')
+        created = next((window for window in manager.windows if window.as_pointer() not in previous), None)
+        if created is None:
+            bpy.ops.wm.window_new()
+            created = next((window for window in manager.windows if window.as_pointer() not in previous), None)
+        if created is None:
+            self.report({'ERROR'}, '无法创建蓝图窗口。')
+            return {'CANCELLED'}
+        created.scene = context.scene
+        area = max(created.screen.areas, key=lambda item: item.width * item.height)
+        area.type = 'NODE_EDITOR'
+        area.ui_type = 'NTEBridgeTree'
+        space = area.spaces.active
+        space.node_tree = tree
+        space.pin = True
+        space.show_region_ui = False
+        pointer, attempts = created.as_pointer(), {'left': 12}
+        bpy.app.timers.register(lambda: _frame_blueprint(pointer, attempts), first_interval=0.25)
         return {'FINISHED'}
 
 

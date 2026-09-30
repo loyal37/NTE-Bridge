@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -179,8 +180,12 @@ def profile_manifest(settings, job_id=None, preview_staging=None, export_plan=No
         for slot_index, part_id, display, blender_material, default in entries:
             path = materials.resolve(part_id, blender_material, default, display).strip()
             key = "NTE_" + uuid.UUID(part_id).hex
-            parts.append({"id": part_id, "slot_key": key, "source_slot": len(parts), "display_name": display,
-                          "material_path": path, "object": obj.name})
+            record = {"id": part_id, "slot_key": key, "source_slot": len(parts), "display_name": display,
+                      "material_path": path, "object": obj.name}
+            if not node.is_main:
+                # Custom parts keep the Blender slot name in UE; original slots use the material asset name.
+                record["ue_slot_name"] = re.sub(r'\.\d{3,}$', '', blender_material.name) if blender_material else display
+            parts.append(record)
             slot_keys.append(key)
             if path.casefold() not in materials.paths:
                 previews.append(SimpleNamespace(source_material=blender_material, material_path=path,

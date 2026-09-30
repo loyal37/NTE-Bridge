@@ -129,6 +129,7 @@ def main():
     assert report['success'] and report['slot_map'] == {p['id']: p['source_slot'] for p in manifest['parts']}, report['slot_map']
     assert [p['object'] for p in manifest['parts']] == ['Body', 'Body', 'Coat_1', 'Belt_2', 'Belt_2']
     assert report['morph_targets'] == ['BeltOnly', 'Smile'], report['morph_targets']
+    assert [report['slot_names'][p['id']] for p in manifest['parts']] ==         ['M_Main', 'M_Main', 'CoatMaterial', 'BeltMaterial', 'BeltMaterial'], report['slot_names']
     instance_path = root + '/MI_BPCoat'
     instances = report['material_instances']
     assert len(instances) == 1 and instances[0]['asset_path'] == instance_path
@@ -145,6 +146,7 @@ def main():
     assert report['features_applied'] is False and len(manifest['features']) == 1
     assert blender_nodes._switch_ht_text(switch, settings) == '2,3+4（初始 0）', blender_nodes._switch_ht_text(switch, settings)
     CHECKS.extend(['separated-objects-joined-into-one-skeletal-mesh', 'slot-map-matches-recorded-order',
+                   'custom-slots-use-blender-slot-names',
                'shape-key-union-imported', 'new-instance-created-with-parent-and-textures', 'mask-texture-bc7-linear',
                'existing-instance-and-mother-untouched', 'switch-ht-string-from-actual-report'])
     first_instance_hash = file_hash(instance_path)

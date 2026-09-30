@@ -7,7 +7,7 @@ import re
 import tempfile
 
 SCHEMA_VERSION = 1
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 HIDDEN_STATE = "$hidden"
 
 
@@ -240,6 +240,8 @@ def validate_manifest(data, job_dir=None):
         _require(type(index) is int and index >= 0, "源材质槽编号必须为非负整数")
         slot_indices.append(index)
         material_paths.append(package_path(part.get("material_path"), "材质路径"))
+        if "ue_slot_name" in part:
+            _text(part["ue_slot_name"], "UE 材质槽名")
     _unique(part_ids, "部件 ID")
     _unique(slot_keys, "导出槽名")
     _unique(slot_indices, "源槽编号")

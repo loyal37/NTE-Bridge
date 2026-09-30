@@ -283,6 +283,14 @@ class ContractTests(unittest.TestCase):
             (root / "meshes/mesh.fbx").write_bytes(b"fixture")
             self.assertEqual(load_manifest(root / "manifest.json"), job)
 
+    def test_custom_slot_name_must_not_be_empty(self):
+        manifest = fixture()
+        manifest["parts"][1]["ue_slot_name"] = "COAT"
+        self.assertIs(validate_manifest(manifest), manifest)
+        manifest["parts"][1]["ue_slot_name"] = " "
+        with self.assertRaisesRegex(BridgeError, "UE 材质槽名"):
+            validate_manifest(manifest)
+
     def test_bone_cycle_and_discontinuous_slots(self):
         job = fixture()
         job["mesh"]["expected"]["bones"][0]["parent"] = "child"

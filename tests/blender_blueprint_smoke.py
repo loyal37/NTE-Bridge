@@ -229,6 +229,8 @@ def main():
     part_objects = [part['object'] for part in manifest['parts']]
     require(part_objects == ['Body', 'Body', 'Coat_1', 'Belt_2', 'Belt_2'], 'export slot order incorrect: %r' % part_objects)
     require([part['source_slot'] for part in manifest['parts']] == list(range(5)), 'joined slots not contiguous')
+    require([part.get('ue_slot_name') for part in manifest['parts']] ==
+            [None, None, 'CoatMaterial', 'BeltMaterial', 'BeltMaterial'], 'custom UE slot names should be Blender slot names')
     require(len(manifest['materials']) == 1, 'unexpected material specs: %r' % manifest['materials'])
     spec = manifest['materials'][0]
     require(spec['kind'] == 'new' and spec['asset_path'] == '/Game/BP/MI_BP_Coat' and
