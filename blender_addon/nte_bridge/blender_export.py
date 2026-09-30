@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -183,8 +182,8 @@ def profile_manifest(settings, job_id=None, preview_staging=None, export_plan=No
             record = {"id": part_id, "slot_key": key, "source_slot": len(parts), "display_name": display,
                       "material_path": path, "object": obj.name}
             if not node.is_main:
-                # Custom parts keep the Blender slot name in UE; original slots use the material asset name.
-                record["ue_slot_name"] = re.sub(r'\.\d{3,}$', '', blender_material.name) if blender_material else display
+                # Custom parts keep the exact Blender slot name in UE; original slots use the material asset name.
+                record["ue_slot_name"] = obj.material_slots[slot_index].name or display
             parts.append(record)
             slot_keys.append(key)
             if path.casefold() not in materials.paths:
