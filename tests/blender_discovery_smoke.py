@@ -137,14 +137,15 @@ def main():
     expected = list(reversed(body["slots"]))
     names = [slot["name"] if "hair" in slot["name"] else slot["material_path"].rsplit("/", 1)[-1]
              for slot in expected]
-    mesh, rig = create_mesh(names)
+    # Every slot owns a face: slots without faces are ignored by design.
+    mesh, rig = create_mesh(names + ["_shared", "_suffix", "_custom"])
     shared_slot = next(index for index, slot in enumerate(expected)
                        if slot["material_path"].endswith("/eye_bantou"))
-    mesh.data.materials.append(mesh.material_slots[shared_slot].material)
+    mesh.data.materials[len(names)] = mesh.material_slots[shared_slot].material
     suffix_material = bpy.data.materials.new("eye_bantou.001")
-    mesh.data.materials.append(suffix_material)
+    mesh.data.materials[len(names) + 1] = suffix_material
     custom_material = bpy.data.materials.new("CustomUnmappedPart")
-    mesh.data.materials.append(custom_material)
+    mesh.data.materials[len(names) + 2] = custom_material
     settings = bpy.context.scene.nte_bridge
     settings.mesh = mesh
     require(settings.armature == rig, "Selecting a bound mesh did not find its armature")

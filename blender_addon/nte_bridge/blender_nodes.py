@@ -8,6 +8,7 @@ import uuid
 
 import bpy
 from bpy.app.handlers import persistent
+import numpy
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, PointerProperty, StringProperty
 
 from .core import BridgeError, ht_material_ids
@@ -83,6 +84,16 @@ def character_root(settings):
     """Default UE folder for new material instances and their textures."""
     from .blender_packaging import default_character_folder
     return default_character_folder(settings) if settings is not None else ''
+
+
+def used_slot_indices(obj):
+    """Material slots that have at least one face; empty slots are ignored everywhere."""
+    polygons = obj.data.polygons if obj is not None and obj.type == 'MESH' else ()
+    if not len(polygons):
+        return set()
+    indices = numpy.empty(len(polygons), dtype=numpy.int32)
+    polygons.foreach_get('material_index', indices)
+    return {int(index) for index in numpy.unique(indices) if index < len(obj.material_slots)}
 
 
 def _ht_slot_map(settings):
@@ -239,6 +250,7 @@ class NTEBridgeObjectSlot(bpy.types.PropertyGroup):
     material: PointerProperty(type=bpy.types.Material)
     slot_index: IntProperty()
     label: StringProperty()
+    used: BoolProperty(default=True)
     split: BoolProperty(name='单独输出', default=False, update=lambda slot, context: _slot_split_changed(slot))
 
 
@@ -314,8 +326,9 @@ class NTEBridgeObject(_NTENode, bpy.types.Node):
         elif expected is not None and rig != expected:
             layout.label(text='绑定的骨架与主网格不同：' + rig.name, icon='ERROR')
         keys = self.target.data.shape_keys
-        layout.label(text='%d 个材质槽 · %d 个形态键' % (len(self.target.material_slots),
-                     max(0, len(keys.key_blocks) - 1) if keys else 0))
+        used = sum(slot.used for slot in self.slots)
+        slots_text = '%d 个材质槽' % used if used == len(self.slots) else '使用 %d / 共 %d 个材质槽' % (used, len(self.slots))
+        layout.label(text='%s · %d 个形态键' % (slots_text, max(0, len(keys.key_blocks) - 1) if keys else 0))
         if [slot.material for slot in self.target.material_slots] != [slot.material for slot in self.slots]:
             layout.operator('nte_bridge.refresh_slots' if self.is_main else 'nte_bridge.sync_blueprint',
                             text='材质槽已变化，点击刷新', icon='FILE_REFRESH')
@@ -326,7 +339,8 @@ class NTEBridgeObject(_NTENode, bpy.types.Node):
             box.prop(self, 'hide_auto')
             box.label(text='勾选的槽单独输出，可接入切换：')
             for slot in self.slots:
-                box.prop(slot, 'split', text='%d · %s' % (slot.slot_index, slot.label))
+                if slot.used:
+                    box.prop(slot, 'split', text='%d · %s' % (slot.slot_index, slot.label))
 
 
 def _slot_label(material, index):
@@ -361,27 +375,35 @@ def sync_object_node(node, settings):
             if node.target != settings.mesh:
                 node.target = settings.mesh
             split = {slot.part_id for slot in node.slots if slot.split}
+            used = used_slot_indices(settings.mesh)
             node.slots.clear()
             for part in settings.parts:
                 slot = node.slots.add()
                 slot.part_id, slot.material = part.part_id, part.source_material
                 slot.slot_index, slot.label = part.source_slot, part.display_name or _slot_label(part.source_material, part.source_slot)
                 slot.split = part.part_id in split
+                slot.used = part.used = part.source_slot in used
         elif node.target is not None:
             old = [(slot.slot_index, slot.material, slot.part_id, slot.split) for slot in node.slots]
             materials = [slot.material for slot in node.target.material_slots]
             identities = _match_slot_ids(old, materials)
+            used = used_slot_indices(node.target)
             node.slots.clear()
             for index, (material, (part_id, split)) in enumerate(zip(materials, identities)):
                 slot = node.slots.add()
                 slot.part_id, slot.material, slot.slot_index = part_id, material, index
-                slot.label, slot.split = _slot_label(material, index), split
+                slot.label, slot.split, slot.used = _slot_label(material, index), split, index in used
         else:
             node.slots.clear()
         splits = [slot for slot in node.slots if slot.split]
         _sync_sockets(node.outputs, [('all', '其余槽位' if splits else '输出')] +
                       [(slot.part_id, slot.label) for slot in splits], OBJECT_SOCKET)
         _sync_sockets(node.inputs, [(slot.part_id, slot.label) for slot in node.slots], MATERIAL_SOCKET)
+        # Unused slots keep their socket (and links) but are unavailable until faces use them again.
+        for slot, socket in zip(node.slots, node.inputs):
+            socket.enabled = slot.used
+        for slot in splits:
+            next(socket for socket in node.outputs if socket.identifier == slot.part_id).enabled = slot.used
         _refresh_auto(node, settings)
         node.width = max(node.width, _text_width([node.target.name if node.target else ''], 260))
     finally:
@@ -737,7 +759,7 @@ def _collect_parts(node, socket_identifier, depth=0):
     if node.bl_idname == 'NTEBridgeObject':
         split = {slot.part_id for slot in node.slots if slot.split}
         if socket_identifier == 'all':
-            return [slot.part_id for slot in node.slots if slot.part_id not in split]
+            return [slot.part_id for slot in node.slots if slot.used and slot.part_id not in split]
         return [socket_identifier]
     parts = []
     if node.bl_idname in {'NTEBridgeGroup', 'NTEBridgeSwitch'}:
@@ -971,8 +993,8 @@ def graph_dict(tree):
         if kind == 'NTEBridgeObject':
             nodes.append({'id': node.node_id, 'type': 'OBJECT', 'label': node.draw_label(),
                           'object_id': node.target.name if node.target else '', 'main': node.is_main,
-                          'parts': [slot.part_id for slot in node.slots],
-                          'split': [slot.part_id for slot in node.slots if slot.split]})
+                          'parts': [slot.part_id for slot in node.slots if slot.used],
+                          'split': [slot.part_id for slot in node.slots if slot.split and slot.used]})
         elif kind == 'NTEBridgeMaterial':
             nodes.append({'id': node.node_id, 'type': 'MATERIAL', 'label': node.draw_label(),
                           'params': [{'id': row.param_id, 'name': row.param} for row in node.params]
@@ -995,8 +1017,8 @@ def graph_dict(tree):
         if link.to_node.bl_idname == 'NodeReroute' or link.is_muted:
             continue
         source = _through_reroute(link)
-        if source is None:
-            continue
+        if source is None or not source.from_socket.enabled or not link.to_socket.enabled:
+            continue  # Unused material slots are ignored together with their links.
         if not _sockets_compatible(source.from_socket, link.to_socket):
             raise BridgeError('节点「%s」→「%s」连线类型不兼容' % (source.from_node.name, link.to_node.name))
         links.append({'from_node': source.from_node.node_id, 'from_socket': source.from_socket.identifier,
@@ -1013,15 +1035,22 @@ def _object_slots_changed(scene, depsgraph=None):
     tree = getattr(settings, 'graph', None) if settings else None
     if tree is None:
         return
+    geometry = set()
+    if depsgraph is not None:
+        for update in depsgraph.updates:
+            if update.is_updated_geometry:
+                geometry.add(update.id.original)
     for node in object_nodes(tree):
         if node.target is None:
             continue
-        current = [slot.material for slot in node.target.material_slots]
         if node.is_main:
-            current_parts = [part.part_id for part in settings.parts]
-            if current_parts != [slot.part_id for slot in node.slots]:
-                sync_object_node(node, settings)
-        elif current != [slot.material for slot in node.slots]:
+            stale = [part.part_id for part in settings.parts] != [slot.part_id for slot in node.slots]
+        else:
+            stale = [slot.material for slot in node.target.material_slots] != [slot.material for slot in node.slots]
+        if not stale and (node.target in geometry or node.target.data in geometry):
+            used = used_slot_indices(node.target)
+            stale = [slot.slot_index in used for slot in node.slots] != [slot.used for slot in node.slots]
+        if stale:
             sync_object_node(node, settings)
 
 

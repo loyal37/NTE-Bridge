@@ -55,6 +55,7 @@ class NTEBridgePartEntry(bpy.types.PropertyGroup):
     automatic_material_path: StringProperty(options={'HIDDEN'})
     source_material: PointerProperty(type=bpy.types.Material)
     catalog_material: StringProperty(name="选择角色材质", update=_catalog_changed)
+    used: BoolProperty(default=True, options={'HIDDEN'})
 
 
 class NTEBridgeSourceMeshEntry(bpy.types.PropertyGroup):
@@ -1120,7 +1121,10 @@ class NTEBRIDGE_OT_asset_dialog(bpy.types.Operator):
 class NTEBRIDGE_UL_parts(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         layout.label(text='%d · %s' % (item.source_slot, item.display_name), icon='MATERIAL')
-        layout.label(text='已映射' if item.material_path else '待映射', icon='CHECKMARK' if item.material_path else 'ERROR')
+        if not item.used:
+            layout.label(text='空槽，不导出', icon='BLANK1')
+        else:
+            layout.label(text='已映射' if item.material_path else '待映射', icon='CHECKMARK' if item.material_path else 'ERROR')
 
 
 class NTEBRIDGE_UL_textures(bpy.types.UIList):
@@ -1221,9 +1225,10 @@ class NTEBRIDGE_PT_main(bpy.types.Panel):
                 column.label(text='已识别绑定骨架：' + rig.name, icon='ARMATURE_DATA')
             else:
                 column.label(text='网格尚未绑定骨架', icon='ERROR')
-            mapped = sum(bool(part.material_path) for part in settings.parts)
-            column.label(text='材质槽 %d / %d 已映射' % (mapped, len(settings.parts)),
-                         icon='CHECKMARK' if mapped and mapped == len(settings.parts) else 'INFO')
+            used = [part for part in settings.parts if part.used]
+            mapped = sum(bool(part.material_path) for part in used)
+            column.label(text='材质槽 %d / %d 已映射' % (mapped, len(used)),
+                         icon='CHECKMARK' if mapped and mapped == len(used) else 'INFO')
         if settings.source_folder and _resolved_folder(settings.source_folder).casefold() != str(_source_data(settings).get('folder', '')).casefold():
             column.label(text='目录已改变，请重新读取角色', icon='INFO')
 

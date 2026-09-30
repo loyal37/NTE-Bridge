@@ -123,6 +123,9 @@ def main():
 
     body = quad_mesh('Body', rig, [main_a, main_b], (0, 0, 0), ['Smile'])
     coat = quad_mesh('Coat_1', rig, [coat_material], (0, 0.5, 0))
+    # Separated objects keep the original object's slots; these have no faces and must be ignored.
+    body.data.materials.append(bpy.data.materials.new('UnusedBodySlot'))
+    coat.data.materials.append(main_a)
     belt = quad_mesh('Belt_2', rig, [belt_material, belt_material], (0, -0.5, 0.2), ['Smile', 'BeltOnly'])
     reference = quad_mesh('Reference', rig, [main_a], (3, 0, 0))
 
@@ -136,7 +139,7 @@ def main():
     settings.cache_root = str(OUT / 'cache')
     settings.mesh = body
     require(settings.graph is not None, 'choosing the mesh did not create the blueprint')
-    for part in settings.parts:
+    for part in settings.parts[:2]:
         part.material_path = '/Game/BP/M_Main'
     tree = settings.graph
     main_node = next(n for n in tree.nodes if n.bl_idname == 'NTEBridgeObject' and n.is_main)
@@ -144,7 +147,9 @@ def main():
     require(main_node.outputs[0].is_linked and main_node.target == body, 'main object not wired to generate node')
     require([s.identifier for s in main_node.inputs] == [p.part_id for p in settings.parts],
             'main material inputs do not follow part identities')
-    require(all(s.hide for s in main_node.inputs), 'auto-matched main inputs were not hidden')
+    require(all(s.hide for s in main_node.inputs if s.enabled), 'auto-matched main inputs were not hidden')
+    require([s.enabled for s in main_node.inputs] == [True, True, False] and not settings.parts[2].used,
+            'empty main slot should be unavailable')
     manifest = profile_manifest(settings)
     require(len(manifest['parts']) == 2 and not manifest['features'] and not manifest['materials'],
             'default blueprint changed the original-model workflow')
@@ -170,6 +175,7 @@ def main():
     require(len(output.inputs) >= 3 and not output.inputs[-1].is_linked, 'generate node did not add an input')
 
     coat_node, belt_node = objects['Coat_1'], objects['Belt_2']
+    require([s.name for s in coat_node.inputs if s.enabled] == ['CoatMaterial'], 'empty separated slot was exposed')
     require(not any(s.hide for s in coat_node.inputs) and [s.name for s in belt_node.inputs] ==
             ['BeltMaterial', 'BeltMaterial'], 'custom object material inputs incorrect')
     new_material = tree.nodes.new('NTEBridgeMaterial')
@@ -309,13 +315,35 @@ def main():
     extra = bpy.data.materials.new('CoatLining')
     coat.data.materials.append(extra)
     bpy.context.view_layer.update()
-    require([s.name for s in coat_node.inputs] == ['CoatMaterial', 'CoatLining'] and
+    require([s.name for s in coat_node.inputs] == ['CoatMaterial', 'MainA', 'CoatLining'] and
+            [s.enabled for s in coat_node.inputs] == [True, False, False] and
             coat_node.slots[0].part_id == coat_part and coat_node.inputs[0].is_linked,
             'slot edit did not sync inputs while keeping identity')
     coat.data.materials.pop()
     bpy.context.view_layer.update()
-    require(len(coat_node.inputs) == 1 and coat_node.inputs[0].is_linked, 'removing a slot broke the linked input')
+    require(len(coat_node.inputs) == 2 and coat_node.inputs[0].is_linked, 'removing a slot broke the linked input')
     check('material-inputs-follow-slot-edits')
+
+    coat.data.polygons[0].material_index = 1
+    coat.data.update()
+    bpy.context.view_layer.update()
+    require([s.enabled for s in coat_node.inputs] == [False, True] and coat_node.inputs[0].is_linked,
+            'moving faces did not switch the used slot')
+    coat.data.polygons[0].material_index = 0
+    coat.data.update()
+    bpy.context.view_layer.update()
+    require([s.enabled for s in coat_node.inputs] == [True, False] and coat_node.inputs[0].is_linked,
+            'slot that became used again lost its material link')
+    body = bpy.data.objects['Body']
+    body.data.polygons[1].material_index = 2
+    body.data.update()
+    bpy.context.view_layer.update()
+    must_fail(lambda: profile_manifest(settings), '没有材质')
+    body.data.polygons[1].material_index = 1
+    body.data.update()
+    bpy.context.view_layer.update()
+    require(len(profile_manifest(settings)['parts']) == 5, 'restoring faces did not restore the export')
+    check('empty-slots-ignored-until-faces-use-them')
 
     belt = bpy.data.objects['Belt_2']
     belt.data.uv_layers[0].name = 'UVMap'
@@ -340,7 +368,7 @@ def main():
     legacy = bpy.data.node_groups.new('Legacy', 'NTEBridgeTree')
     legacy.graph_id = 'legacy-graph'
     part_nodes = []
-    for part in settings.parts:
+    for part in settings.parts[:2]:
         node = legacy.nodes.new('NTEBridgePart')
         node.part_id = part.part_id
         node.outputs.new('NTEBridgeSocket', '部件')
@@ -372,7 +400,7 @@ def main():
     states = plan['features'][0]['states']
     require(upgraded.input_slot_count == 3 and upgraded.initial_option == 2 and upgraded.hotkey == 'K', 'cycle settings lost')
     require([s['parts'] for s in states] == [[], [settings.parts[1].part_id], []], 'legacy links not preserved: %r' % states)
-    require(plan['objects'][plan['main']] == [p.part_id for p in settings.parts], 'upgraded main object incomplete')
+    require(plan['objects'][plan['main']] == [p.part_id for p in settings.parts if p.used], 'upgraded main object incomplete')
     settings.graph = old_tree
     check('legacy-v0.3-graph-upgrades-with-links')
 

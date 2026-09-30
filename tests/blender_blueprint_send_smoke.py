@@ -87,6 +87,9 @@ def main():
     body = quad_mesh('Body', rig, [bpy.data.materials.new('MainA'), bpy.data.materials.new('MainB')], (0, 0, 0), ['Smile'])
     coat = quad_mesh('Coat_1', rig, [coat_material], (0, 0.5, 0))
     belt = quad_mesh('Belt_2', rig, [belt_material, belt_material], (0, -0.5, 0.2), ['Smile', 'BeltOnly'])
+    # Separated objects keep original slots without faces; UE must receive only used slots.
+    body.data.materials.append(bpy.data.materials.new('UnusedBodySlot'))
+    coat.data.materials.append(body.material_slots[0].material)
 
     root = '/Game/BPSend/Case_' + uuid.uuid4().hex[:10]
     settings = bpy.context.scene.nte_bridge
@@ -98,7 +101,7 @@ def main():
     settings.engine_dir = ''
     settings.sync_mode = 'commandlet'
     settings.mesh = body
-    for part in settings.parts:
+    for part in settings.parts[:2]:
         part.material_path = root + '/M_Main'
     for obj in bpy.context.selected_objects:
         obj.select_set(False)
@@ -128,6 +131,7 @@ def main():
     manifest = json.loads(Path(settings.last_manifest).read_text(encoding='utf-8'))
     assert report['success'] and report['slot_map'] == {p['id']: p['source_slot'] for p in manifest['parts']}, report['slot_map']
     assert [p['object'] for p in manifest['parts']] == ['Body', 'Body', 'Coat_1', 'Belt_2', 'Belt_2']
+    assert len(report['slot_map']) == 5, 'empty slots reached UE'
     assert report['morph_targets'] == ['BeltOnly', 'Smile'], report['morph_targets']
     assert [report['slot_names'][p['id']] for p in manifest['parts']] ==         ['M_Main', 'M_Main', 'CoatMaterial', 'BeltMaterial', 'BeltMaterial'], report['slot_names']
     instance_path = root + '/MI_BPCoat'
@@ -146,7 +150,7 @@ def main():
     assert report['features_applied'] is False and len(manifest['features']) == 1
     assert blender_nodes._switch_ht_text(switch, settings) == '2,3+4（初始 0）', blender_nodes._switch_ht_text(switch, settings)
     CHECKS.extend(['separated-objects-joined-into-one-skeletal-mesh', 'slot-map-matches-recorded-order',
-                   'custom-slots-use-blender-slot-names',
+                   'custom-slots-use-blender-slot-names', 'empty-slots-not-imported',
                'shape-key-union-imported', 'new-instance-created-with-parent-and-textures', 'mask-texture-bc7-linear',
                'existing-instance-and-mother-untouched', 'switch-ht-string-from-actual-report'])
     first_instance_hash = file_hash(instance_path)

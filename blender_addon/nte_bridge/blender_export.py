@@ -12,6 +12,7 @@ import uuid
 
 import bpy
 from mathutils import Matrix
+import numpy
 
 from .core import BridgeError, compile_blueprint, package_path, validate_manifest, write_json
 from .blender_cache import ensure_cache
@@ -169,12 +170,13 @@ def profile_manifest(settings, job_id=None, preview_staging=None, export_plan=No
     parts, objects, previews = [], [], []
     for node in ordered:
         obj = node.target
+        used = {slot.part_id for slot in node.slots if slot.used}
         if node.is_main:
             entries = [(part.source_slot, part.part_id, part.display_name, part.source_material,
-                        part.material_path.strip()) for part in settings.parts]
+                        part.material_path.strip()) for part in settings.parts if part.part_id in used]
         else:
             entries = [(slot.slot_index, slot.part_id, obj.name + ' · ' + slot.label, slot.material, '')
-                       for slot in node.slots]
+                       for slot in node.slots if slot.used]
         slot_keys = []
         for slot_index, part_id, display, blender_material, default in entries:
             path = materials.resolve(part_id, blender_material, default, display).strip()
@@ -185,7 +187,7 @@ def profile_manifest(settings, job_id=None, preview_staging=None, export_plan=No
                 # Custom parts keep the exact Blender slot name in UE; original slots use the material asset name.
                 record["ue_slot_name"] = obj.material_slots[slot_index].name or display
             parts.append(record)
-            slot_keys.append(key)
+            slot_keys.append((slot_index, key))
             if path.casefold() not in materials.paths:
                 previews.append(SimpleNamespace(source_material=blender_material, material_path=path,
                                                 optional=not node.is_main))
@@ -239,6 +241,25 @@ def profile_manifest(settings, job_id=None, preview_staging=None, export_plan=No
     return manifest
 
 
+def _compact_slots(obj, slot_keys, materials):
+    """Give used slots their bridge material and drop empty slots from the copy."""
+    remap = numpy.zeros(max(1, len(obj.material_slots)), dtype=numpy.int32)
+    for new_index, (old_index, _) in enumerate(slot_keys):
+        remap[old_index] = new_index
+    polygons = obj.data.polygons
+    indices = numpy.empty(len(polygons), dtype=numpy.int32)
+    polygons.foreach_get('material_index', indices)
+    for slot in obj.material_slots:
+        slot.link = 'DATA'
+    obj.data.materials.clear()
+    for _, key in slot_keys:
+        material = bpy.data.materials.new(key)
+        materials.append(material)
+        obj.data.materials.append(material)
+    polygons.foreach_set('material_index', remap[numpy.minimum(indices, len(remap) - 1)])
+    obj.data.update()
+
+
 def _write_export_copy(settings, blend_path, export_plan):
     """Create an isolated scene datablock, then remove every temporary datablock."""
     source_rig = settings.armature
@@ -288,12 +309,8 @@ def _write_export_copy(settings, blend_path, export_plan):
                 obj.data.shape_keys.animation_data_clear()
                 for key in obj.data.shape_keys.key_blocks:
                     key.value = 0.0
-            for index, key in enumerate(slot_keys):
-                material = bpy.data.materials.new(key)
-                materials.append(material)
-                obj.material_slots[index].link = 'DATA'
-                obj.data.materials[index] = material
-            order.extend(slot_keys)
+            _compact_slots(obj, slot_keys, materials)
+            order.extend(key for _, key in slot_keys)
             # Worker identifies roles without relying on temporary object names.
             obj["nte_bridge_export_role"] = "mesh" if position == 0 else "part"
             obj["nte_bridge_export_order"] = position
